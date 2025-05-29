@@ -1,0 +1,7 @@
+Flask
+Werkzeug
+PyOTP
+requests
+twilio
+gunicorn
+uuid
