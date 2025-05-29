@@ -120,70 +120,194 @@ def cleanup_expired_states():
 def index():
     # Page de login avec lien vers l'inscription
     return render_template_string('''
-        <h1>Accès au Compte Cloud</h1>
-        <h2>Connexion</h2>
-        <form action="/login" method="post">
-            Nom d'utilisateur: <input type="text" name="username" required><br>
-            Mot de passe: <input type="password" name="password" required><br>
-            <input type="submit" value="Se Connecter">
-        </form>
-        <p><a href="/register">Nouvel utilisateur? S'inscrire ici.</a></p>
-        <div id="login-status"></div>
-        <script>
-            // Script client-side pour afficher le statut de connexion
-            document.querySelector('form[action="/login"]').addEventListener('submit', async function(event) {
-                event.preventDefault();
-                const form = event.target;
-                const formData = new FormData(form);
-                const response = await fetch(form.action, {
-                    method: form.method,
-                    body: formData
-                });
-                const result = await response.json();
-                const statusDiv = document.getElementById('login-status');
-                statusDiv.innerText = result.message;
-                statusDiv.style.color = result.status === 'fail' ? 'red' : 'green';
-
-                if (result.status === '2fa_required' && result.redirect_url) {
-                    // Si 2FA requise, rediriger vers la page de saisie TOTP
-                    window.location.href = result.redirect_url;
+        <!DOCTYPE html>
+        <html lang="fr">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Connexion au Compte Cloud</title>
+            <!-- Bootstrap CSS -->
+            <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+            <style>
+                body {
+                    background-color: #f8f9fa;
                 }
-            });
-        </script>
+                .container {
+                    max-width: 400px;
+                    margin-top: 50px;
+                    padding: 20px;
+                    background-color: #ffffff;
+                    border-radius: 8px;
+                    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+                }
+                h1, h2 {
+                    text-align: center;
+                    margin-bottom: 20px;
+                }
+                .form-label {
+                    font-weight: bold;
+                }
+                .alert {
+                    margin-top: 20px;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>Accès au Compte Cloud</h1>
+                <h2>Connexion</h2>
+                <form action="/login" method="post">
+                    <div class="mb-3">
+                        <label for="username" class="form-label">Nom d'utilisateur:</label>
+                        <input type="text" class="form-control" id="username" name="username" required>
+                    </div>
+                    <div class="mb-3">
+                        <label for="password" class="form-label">Mot de passe:</label>
+                        <input type="password" class="form-control" id="password" name="password" required>
+                    </div>
+                    <button type="submit" class="btn btn-primary w-100">Se Connecter</button>
+                </form>
+                <p class="text-center mt-3"><a href="/register">Nouvel utilisateur? S'inscrire ici.</a></p>
+                <div id="login-status" class="alert d-none" role="alert"></div>
+            </div>
+
+            <!-- Bootstrap JS (optionnel, pour certains composants Bootstrap) -->
+            <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+            <script>
+                // Script client-side pour afficher le statut de connexion
+                document.querySelector('form[action="/login"]').addEventListener('submit', async function(event) {
+                    event.preventDefault();
+                    const form = event.target;
+                    const formData = new FormData(form);
+                    const response = await fetch(form.action, {
+                        method: form.method,
+                        body: formData
+                    });
+                    const result = await response.json();
+                    const statusDiv = document.getElementById('login-status');
+
+                    // Afficher le message
+                    statusDiv.innerText = result.message;
+                    statusDiv.classList.remove('d-none', 'alert-success', 'alert-danger', 'alert-info'); // Nettoyer les classes précédentes
+
+                    if (result.status === 'fail') {
+                        statusDiv.classList.add('alert-danger'); // Rouge pour échec
+                    } else if (result.status === '2fa_required') {
+                         statusDiv.classList.add('alert-info'); // Bleu pour info/attente
+                    }
+                     statusDiv.classList.remove('d-none'); // Rendre visible
+
+                    if (result.status === '2fa_required' && result.redirect_url) {
+                        // Si 2FA requise, rediriger vers la page de saisie TOTP
+                        // Ajouter un petit délai pour que l'utilisateur lise le message
+                        setTimeout(() => {
+                            window.location.href = result.redirect_url;
+                        }, 2000); // Rediriger après 2 secondes
+                    }
+                });
+            </script>
+        </body>
+        </html>
     ''')
 
 @app.route('/register')
 def register_page():
     # Page d'inscription
     return render_template_string('''
-        <h1>Inscription</h1>
-        <form action="/register" method="post">
-            Nom d'utilisateur: <input type="text" name="username" required><br>
-            Mot de passe: <input type="password" name="password" required><br>
-            Numéro de téléphone (pour SMS, format +12223334444): <input type="text" name="phone_number"><br>
-            Choisissez vos dispositifs 2FA (au moins un):<br>
-            <input type="checkbox" name="device" value="pi"> Raspberry Pi<br>
-            <input type="checkbox" name="device" value="esp32"> ESP32<br>
-            <input type="submit" value="S'inscrire">
-        </form>
-        <p><a href="/">Retour à la connexion.</a></p>
-        <div id="register-status"></div>
-        <script>
-            // Script client-side pour afficher le statut d'inscription
-            document.querySelector('form[action="/register"]').addEventListener('submit', async function(event) {
-                event.preventDefault();
-                const form = event.target;
-                const formData = new FormData(form);
-                const response = await fetch(form.action, {
-                    method: form.method,
-                    body: formData
+        <!DOCTYPE html>
+        <html lang="fr">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Inscription</title>
+            <!-- Bootstrap CSS -->
+            <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+             <style>
+                body {
+                    background-color: #f8f9fa;
+                }
+                .container {
+                    max-width: 500px;
+                    margin-top: 50px;
+                    padding: 20px;
+                    background-color: #ffffff;
+                    border-radius: 8px;
+                    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+                }
+                h1, h2 {
+                    text-align: center;
+                    margin-bottom: 20px;
+                }
+                 .form-label {
+                    font-weight: bold;
+                }
+                 .alert {
+                    margin-top: 20px;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>Inscription</h1>
+                <form action="/register" method="post">
+                    <div class="mb-3">
+                        <label for="username" class="form-label">Nom d'utilisateur:</label>
+                        <input type="text" class="form-control" id="username" name="username" required>
+                    </div>
+                    <div class="mb-3">
+                        <label for="password" class="form-label">Mot de passe:</label>
+                        <input type="password" class="form-control" id="password" name="password" required>
+                    </div>
+                     <div class="mb-3">
+                        <label for="phone_number" class="form-label">Numéro de téléphone (pour SMS, format +12223334444):</label>
+                        <input type="text" class="form-control" id="phone_number" name="phone_number">
+                         <small class="form-text text-muted">Requis pour recevoir les codes TOTP et les alertes.</small>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Choisissez vos dispositifs 2FA (au moins un):</label><br>
+                        <div class="form-check form-check-inline">
+                            <input class="form-check-input" type="checkbox" id="device_pi" name="device" value="pi">
+                            <label class="form-check-label" for="device_pi">Raspberry Pi</label>
+                        </div>
+                        <div class="form-check form-check-inline">
+                            <input class="form-check-input" type="checkbox" id="device_esp32" name="device" value="esp32">
+                            <label class="form-check-label" for="device_esp32">ESP32</label>
+                        </div>
+                    </div>
+                    <button type="submit" class="btn btn-success w-100">S'inscrire</button>
+                </form>
+                <p class="text-center mt-3"><a href="/">Retour à la connexion.</a></p>
+                <div id="register-status" class="alert d-none" role="alert"></div>
+            </div>
+
+            <!-- Bootstrap JS (optionnel) -->
+            <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+            <script>
+                // Script client-side pour afficher le statut d'inscription
+                document.querySelector('form[action="/register"]').addEventListener('submit', async function(event) {
+                    event.preventDefault();
+                    const form = event.target;
+                    const formData = new FormData(form);
+                    const response = await fetch(form.action, {
+                        method: form.method,
+                        body: formData
+                    });
+                    const result = await response.json();
+                    const statusDiv = document.getElementById('register-status');
+
+                    statusDiv.innerText = result.message;
+                    statusDiv.classList.remove('d-none', 'alert-success', 'alert-danger'); // Nettoyer les classes précédentes
+
+                    if (response.ok) {
+                        statusDiv.classList.add('alert-success'); // Vert pour succès
+                    } else {
+                        statusDiv.classList.add('alert-danger'); // Rouge pour échec
+                    }
+                    statusDiv.classList.remove('d-none'); // Rendre visible
                 });
-                const result = await response.json();
-                const statusDiv = document.getElementById('register-status');
-                statusDiv.innerText = result.message;
-                statusDiv.style.color = response.ok ? 'green' : 'red';
-            });
-        </script>
+            </script>
+        </body>
+        </html>
     ''')
 
 
@@ -297,38 +421,85 @@ def verify_totp_page():
 
     # Afficher le formulaire de saisie TOTP
     return render_template_string('''
-        <h1>Vérification 2FA</h1>
-        <p>Veuillez saisir le code TOTP reçu par SMS.</p>
-        <form action="/verify_totp" method="post">
-            <input type="hidden" name="token" value="{{ token }}">
-            Code TOTP: <input type="text" name="totp_code" required><br>
-            <input type="submit" value="Vérifier le Code">
-        </form>
-        <div id="verification-status"></div>
-        <script>
-            // Script client-side pour afficher le statut de vérification
-            document.querySelector('form[action="/verify_totp"]').addEventListener('submit', async function(event) {
-                event.preventDefault();
-                const form = event.target;
-                const formData = new FormData(form);
-                const response = await fetch(form.action, {
-                    method: form.method,
-                    body: formData
-                });
-                const result = await response.json();
-                const statusDiv = document.getElementById('verification-status');
-                statusDiv.innerText = result.message;
-                statusDiv.style.color = result.status === 'success' ? 'green' : 'red';
-
-                if (result.status === 'success' && result.redirect_url) {
-                    // Si la vérification 2FA réussit, rediriger vers l'espace cloud
-                    window.location.href = result.redirect_url;
-                } else if (result.status === 'fail') {
-                    // Si échec, le message d'erreur est déjà affiché.
-                    // L'utilisateur peut réessayer si la tentative n'a pas expiré.
+        <!DOCTYPE html>
+        <html lang="fr">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Vérification 2FA</title>
+            <!-- Bootstrap CSS -->
+            <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+             <style>
+                body {
+                    background-color: #f8f9fa;
                 }
-            });
-        </script>
+                .container {
+                    max-width: 400px;
+                    margin-top: 50px;
+                    padding: 20px;
+                    background-color: #ffffff;
+                    border-radius: 8px;
+                    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+                }
+                h1, h2 {
+                    text-align: center;
+                    margin-bottom: 20px;
+                }
+                 .form-label {
+                    font-weight: bold;
+                }
+                 .alert {
+                    margin-top: 20px;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>Vérification 2FA</h1>
+                <p class="text-center">Veuillez saisir le code TOTP reçu par SMS.</p>
+                <form action="/verify_totp" method="post">
+                    <input type="hidden" name="token" value="{{ token }}">
+                    <div class="mb-3">
+                         <label for="totp_code" class="form-label">Code TOTP:</label>
+                         <input type="text" class="form-control" id="totp_code" name="totp_code" required>
+                    </div>
+                    <button type="submit" class="btn btn-primary w-100">Vérifier le Code</button>
+                </form>
+                <div id="verification-status" class="alert d-none" role="alert"></div>
+            </div>
+
+            <!-- Bootstrap JS (optionnel) -->
+            <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+            <script>
+                // Script client-side pour afficher le statut de vérification
+                document.querySelector('form[action="/verify_totp"]').addEventListener('submit', async function(event) {
+                    event.preventDefault();
+                    const form = event.target;
+                    const formData = new FormData(form);
+                    const response = await fetch(form.action, {
+                        method: form.method,
+                        body: formData
+                    });
+                    const result = await response.json();
+                    const statusDiv = document.getElementById('verification-status');
+
+                    statusDiv.innerText = result.message;
+                    statusDiv.classList.remove('d-none', 'alert-success', 'alert-danger'); // Nettoyer les classes précédentes
+
+                    if (result.status === 'success') {
+                        statusDiv.classList.add('alert-success'); // Vert pour succès
+                         // Rediriger après un petit délai
+                         setTimeout(() => {
+                            window.location.href = result.redirect_url;
+                        }, 2000); // Rediriger après 2 secondes
+                    } else {
+                        statusDiv.classList.add('alert-danger'); // Rouge pour échec
+                    }
+                    statusDiv.classList.remove('d-none'); // Rendre visible
+                });
+            </script>
+        </body>
+        </html>
     ''', token=auth_token) # Passer le token au template
 
 @app.route('/verify_totp', methods=['POST'])
@@ -448,9 +619,41 @@ def cloud_space():
         #      print(f"Statut de succès effacé pour {authenticated_user} après accès à l'espace cloud.")
 
         return render_template_string(f'''
-            <h1>Bienvenue dans votre Espace Cloud, {authenticated_user}!</h1>
-            <p>Ceci est votre espace personnel sécurisé.</p>
-            <p><a href="/">Se déconnecter (simulé - retourne à l'accueil)</a></p>
+            <!DOCTYPE html>
+            <html lang="fr">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Espace Cloud</title>
+                <!-- Bootstrap CSS -->
+                <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+                 <style>
+                    body {
+                        background-color: #f8f9fa;
+                    }
+                    .container {
+                        margin-top: 50px;
+                        padding: 20px;
+                        background-color: #ffffff;
+                        border-radius: 8px;
+                        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+                    }
+                    h1, h2 {
+                        text-align: center;
+                        margin-bottom: 20px;
+                    }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1>Bienvenue dans votre Espace Cloud, {authenticated_user}!</h1>
+                    <p>Ceci est votre espace personnel sécurisé.</p>
+                    <p class="text-center mt-4"><a href="/" class="btn btn-danger">Se déconnecter (simulé - retourne à l'accueil)</a></p>
+                </div>
+                 <!-- Bootstrap JS (optionnel) -->
+                <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+            </body>
+            </html>
         ''')
     else:
         # Rediriger vers la page de connexion si non authentifié temporairement
