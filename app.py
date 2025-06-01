@@ -72,15 +72,21 @@ def load_users():
         except json.JSONDecodeError:
             # Gérer le cas où le fichier JSON est vide ou corrompu
             return {}
+        except Exception as e:
+             print(f"Erreur lors du chargement de users.json: {e}")
+             return {}
     else:
         # Si le fichier n'existe pas, retourner un dictionnaire vide
         return {}
 
 def save_users(users_data):
     """Sauvegarde les données des utilisateurs dans le fichier JSON."""
-    # Utiliser 'w' pour écraser le contenu existant avec les nouvelles données
-    with open(JSON_FILE_PATH, 'w') as f:
-        json.dump(users_data, f, indent=4) # Utiliser indent pour une meilleure lisibilité
+    try:
+        with open(JSON_FILE_PATH, 'w') as f:
+            json.dump(users_data, f, indent=4) # Utiliser indent pour une meilleure lisibilité
+    except Exception as e:
+        print(f"Erreur lors de la sauvegarde de users.json: {e}")
+
 
 # Charger les utilisateurs au démarrage de l'application
 # ATTENTION: Sur les services gratuits comme Render, ce fichier peut être réinitialisé
@@ -89,30 +95,37 @@ users = load_users()
 print(f"Chargé {len(users)} utilisateurs depuis {JSON_FILE_PATH}")
 
 # --- Gestion de l'état d'authentification temporaire ---
-# Stocke les tentatives de connexion en attente de 2FA
-# {token_unique: {'username': '...', 'device_type': '...', 'expected_totp': '...', 'timestamp': '...'}}
-pending_2fa_verifications = {}
-PENDING_TIMEOUT = 300 # Durée de validité de l'attente 2FA en secondes (5 minutes)
+# Utilise un dictionnaire unique pour suivre l'état de chaque tentative de connexion par utilisateur
+# {username: {'status': '...', 'device': '...', 'received_totp': '...', 'browser_token': '...', 'timestamp': '...'}}
+# Status can be: 'password_correct', 'awaiting_device_totp', 'awaiting_user_totp_entry', 'success', 'fail'
+auth_states = {}
+STATE_TIMEOUT = 300 # Durée de validité d'un état en secondes (5 minutes)
 
-# Stocke l'état d'authentification final pour que les appareils puissent le consulter
-# {username: {'status': 'success'/'fail', 'timestamp': '...'}}
-recent_auth_status = {}
-STATUS_TIMEOUT = 60 # Durée pendant laquelle l'état final est conservé pour les appareils (pour le polling des appareils)
+# Stocke le dernier timestamp de polling pour chaque appareil d'un utilisateur
+# {username: {device_type: timestamp}}
+device_last_seen = {}
+DEVICE_TIMEOUT = 10 # Temps en secondes après lequel un appareil est considéré hors ligne (doit être > POLLING_INTERVAL des clients)
+
 
 def cleanup_expired_states():
     """Nettoie les états d'authentification temporaires expirés."""
     current_time = time.time()
-    # Nettoyer les vérifications 2FA en attente expirées
-    expired_pending_tokens = [token for token, data in pending_2fa_verifications.items() if current_time > data['timestamp'] + PENDING_TIMEOUT]
-    for token in expired_pending_tokens:
-        print(f"Nettoyage de la vérification 2FA en attente expirée pour {pending_2fa_verifications[token]['username']}")
-        del pending_2fa_verifications[token]
+    expired_users = [username for username, data in auth_states.items() if current_time > data['timestamp'] + STATE_TIMEOUT]
+    for username in expired_users:
+        print(f"Nettoyage de l'état expiré pour {username} (statut: {auth_states[username]['status']})")
+        del auth_states[username]
+        # Optionnel: Nettoyer aussi les entrées device_last_seen pour cet utilisateur s'il n'y a plus d'état actif
+        if username in device_last_seen:
+             del device_last_seen[username]
 
-    # Nettoyer les statuts d'authentification récents expirés
-    expired_status_users = [username for username, data in recent_auth_status.items() if current_time > data['timestamp'] + STATUS_TIMEOUT]
-    for username in expired_status_users:
-        print(f"Nettoyage du statut d'authentification récent expiré pour {username}")
-        del recent_auth_status[username]
+
+def is_device_online(username, device_type):
+    """Vérifie si un appareil spécifique pour un utilisateur est considéré en ligne."""
+    current_time = time.time()
+    if username in device_last_seen and device_type in device_last_seen[username]:
+        return current_time < device_last_seen[username][device_type] + DEVICE_TIMEOUT
+    return False
+
 
 # --- Routes pour l'interface utilisateur ---
 
@@ -243,7 +256,7 @@ def register_page():
                 }
                  .alert {
                     margin-top: 20px;
-                }
+                 }
             </style>
         </head>
         <body>
@@ -333,7 +346,7 @@ def register():
 
     users[username] = {
         'password_hash': generate_password_hash(password),
-        'totp_secret': totp_secret,
+        'totp_secret': totp_secret, # Le secret est stocké sur le serveur ET sur les appareils
         'enabled_devices': enabled_devices,
         'phone_number': phone_number if phone_number else None
     }
@@ -360,10 +373,9 @@ def login():
         elif not user:
              print(f"Tentative de connexion échouée pour utilisateur inconnu: {username}")
 
-        # Mettre à jour le statut récent pour les appareils (échec)
-        # Ceci permet au Pi/ESP32 de réagir même si le mot de passe initial échoue
-        if username: # Éviter d'enregistrer un statut pour un utilisateur None
-             recent_auth_status[username] = {'status': 'fail', 'timestamp': time.time()}
+        # Mettre à jour l'état pour les appareils (échec)
+        if username: # Éviter d'enregistrer un état pour un utilisateur None
+             auth_states[username] = {'status': 'fail', 'timestamp': time.time()}
 
         # Retourner l'échec au navigateur
         return jsonify({"status": "fail", "message": "Nom d'utilisateur ou mot de passe invalide"}), 401
@@ -377,49 +389,75 @@ def login():
              print(f"Aucun appareil 2FA activé pour l'utilisateur {username}.")
              if user.get('phone_number'):
                   send_sms(user['phone_number'], f"Tentative de connexion échouée: Aucun appareil 2FA activé pour votre compte {username}.")
-             recent_auth_status[username] = {'status': 'fail', 'timestamp': time.time()}
+             auth_states[username] = {'status': 'fail', 'timestamp': time.time()}
              return jsonify({"status": "fail", "message": "Aucun appareil 2FA configuré pour votre compte"}), 400
 
-        # Choisir aléatoirement un dispositif activé
-        chosen_device = random.choice(enabled_devices)
-        print(f"Dispositif 2FA choisi aléatoirement pour {username}: {chosen_device}")
+        # Vérifier quels appareils activés sont en ligne
+        online_devices = [device for device in enabled_devices if is_device_online(username, device)]
+        print(f"Appareils activés pour {username}: {enabled_devices}. Appareils en ligne: {online_devices}")
 
-        # Générer le TOTP pour le secret de l'utilisateur
-        totp = pyotp.TOTP(user['totp_secret'])
-        current_totp = totp.now()
-        print(f"TOTP généré pour {username} ({chosen_device}): {current_totp}")
+        if not online_devices:
+             # Aucun appareil activé n'est en ligne
+             print(f"Aucun appareil 2FA en ligne pour l'utilisateur {username}.")
+             message = f"Tentative de connexion échouée: Aucun de vos appareils 2FA ({', '.join(enabled_devices)}) n'est actuellement en ligne. Veuillez vérifier vos appareils."
+             if user.get('phone_number'):
+                  send_sms(user['phone_number'], message)
+             auth_states[username] = {'status': 'fail', 'timestamp': time.time()}
+             return jsonify({"status": "fail", "message": message}), 400
 
-        # Envoyer le TOTP à l'utilisateur via SMS
-        sms_message = f"Votre code TOTP pour votre compte cloud ({chosen_device}): {current_totp}. Ce code est valide pendant une courte période."
-        send_sms(user['phone_number'], sms_message)
+        # Choisir aléatoirement un dispositif PARMI CEUX QUI SONT EN LIGNE
+        chosen_device = random.choice(online_devices)
+        print(f"Dispositif 2FA choisi aléatoirement parmi les appareils en ligne pour {username}: {chosen_device}")
 
-        # Créer un token unique pour cette tentative 2FA
-        auth_token = str(uuid.uuid4())
+        # Créer un token unique pour cette tentative 2FA (pour le navigateur)
+        browser_token = str(uuid.uuid4())
 
-        # Stocker les informations de la tentative en attente
-        pending_2fa_verifications[auth_token] = {
-            'username': username,
-            'device_type': chosen_device, # Stocker le type d'appareil choisi
-            'expected_totp': current_totp,
+        # Mettre à jour l'état pour les appareils et le navigateur
+        auth_states[username] = {
+            'status': 'awaiting_device_totp', # Le serveur attend que l'appareil envoie le TOTP
+            'device': chosen_device,          # L'appareil attendu
+            'browser_token': browser_token,   # Token pour lier la session navigateur à l'état
+            'received_totp': None,            # Le TOTP reçu de l'appareil sera stocké ici
             'timestamp': time.time()
         }
-        print(f"Tentative 2FA en attente stockée avec le token: {auth_token}")
-
-        # Mettre à jour le statut récent pour les appareils (en attente de 2FA)
-        recent_auth_status[username] = {'status': 'pending_2fa', 'timestamp': time.time()}
+        print(f"État pour {username} mis à jour: awaiting_device_totp (appareil attendu: {chosen_device})")
 
 
         # Rediriger le navigateur vers la page de saisie TOTP avec le token
-        return jsonify({"status": "2fa_required", "message": f"Mot de passe correct. Un code TOTP a été envoyé par SMS via votre appareil {chosen_device}. Veuillez le saisir.", "redirect_url": url_for('verify_totp_page', token=auth_token, _external=True)}), 200
+        # L'utilisateur attendra sur cette page que le SMS arrive
+        return jsonify({"status": "2fa_required", "message": f"Mot de passe correct. Veuillez attendre le code TOTP envoyé par SMS via votre appareil {chosen_device}.", "redirect_url": url_for('verify_totp_page', token=browser_token, _external=True)}), 200
 
 @app.route('/verify_totp_page')
 def verify_totp_page():
     # Page pour saisir le TOTP
-    auth_token = request.args.get('token')
-    if not auth_token or auth_token not in pending_2fa_verifications:
-        return "Requête invalide ou expirée.", 400 # Gérer les tokens manquants ou invalides
+    browser_token = request.args.get('token')
 
-    # Afficher le formulaire de saisie TOTP
+    # Trouver l'état de l'utilisateur basé sur le token du navigateur
+    username = None
+    for user, state_data in auth_states.items():
+        if state_data.get('browser_token') == browser_token:
+            username = user
+            break
+
+    if not username or username not in auth_states or time.time() > auth_states[username]['timestamp'] + STATE_TIMEOUT:
+        print(f"Accès à verify_totp_page échoué: Token navigateur invalide ou état expiré pour token {browser_token}.")
+        # Nettoyer l'état si trouvé mais expiré
+        if username and username in auth_states:
+             del auth_states[username]
+        return "Requête invalide ou expirée. Veuillez recommencer la connexion.", 400 # Gérer les tokens manquants ou invalides
+
+    # L'état existe et n'est pas expiré. Afficher la page de saisie TOTP.
+    # Le message peut indiquer d'attendre le SMS si le TOTP n'a pas encore été reçu de l'appareil.
+    state_data = auth_states[username]
+    current_status = state_data['status']
+    message = "Veuillez saisir le code TOTP reçu par SMS."
+    if current_status == 'awaiting_device_totp':
+        message = f"Mot de passe correct. Veuillez attendre que votre appareil {state_data.get('device', 'sélectionné')} génère et envoie le code TOTP."
+    elif current_status == 'awaiting_user_totp_entry':
+         message = f"Code TOTP reçu de votre appareil {state_data.get('device', 'sélectionné')}. Veuillez saisir le code TOTP reçu par SMS."
+    # Si le statut est 'success' ou 'fail', l'utilisateur ne devrait pas être sur cette page,
+    # mais la logique de redirection dans le JS gère cela.
+
     return render_template_string('''
         <!DOCTYPE html>
         <html lang="fr">
@@ -456,11 +494,15 @@ def verify_totp_page():
         <body>
             <div class="container">
                 <h1>Vérification 2FA</h1>
-                <p class="text-center">Veuillez saisir le code TOTP reçu par SMS.</p>
+                <p class="text-center" id="status-message">{{ message }}</p>
                 <form action="/verify_totp" method="post">
-                    <input type="hidden" name="token" value="{{ token }}">
+                    <input type="hidden" name="token" value="{{ browser_token }}">
                     <div class="mb-3">
-                         <label for="totp_code" class="form-label">Code TOTP:</label>
+                         <label for="device_name" class="form-label">Nom de l'appareil (ex: pi ou esp32):</label>
+                         <input type="text" class="form-control" id="device_name" name="device_name" required>
+                    </div>
+                    <div class="mb-3">
+                         <label for="totp_code" class="form-label">Code TOTP reçu par SMS:</label>
                          <input type="text" class="form-control" id="totp_code" name="totp_code" required>
                     </div>
                     <button type="submit" class="btn btn-primary w-100">Vérifier le Code</button>
@@ -494,69 +536,139 @@ def verify_totp_page():
                         }, 2000); // Rediriger après 2 secondes
                     } else {
                         statusDiv.classList.add('alert-danger'); // Rouge pour échec
+                        // Si échec, l'utilisateur peut réessayer si l'état n'a pas expiré.
+                        // Le message d'erreur est déjà affiché.
                     }
                     statusDiv.classList.remove('d-none'); // Rendre visible
                 });
             </script>
         </body>
         </html>
-    ''', token=auth_token) # Passer le token au template
+    ''', browser_token=browser_token, message=message) # Passer le token et le message au template
 
 @app.route('/verify_totp', methods=['POST'])
 def verify_totp():
     # Nettoyer les états expirés
     cleanup_expired_states()
 
-    auth_token = request.form.get('token')
-    totp_code = request.form.get('totp_code')
+    browser_token = request.form.get('token')
+    device_name_user_input = request.form.get('device_name') # Nom de l'appareil saisi par l'utilisateur
+    totp_code_user_input = request.form.get('totp_code')     # Code TOTP saisi par l'utilisateur
 
-    # Récupérer les données de la tentative en attente
-    pending_data = pending_2fa_verifications.get(auth_token)
+    # Trouver l'état de l'utilisateur basé sur le token du navigateur
+    username = None
+    for user, state_data in auth_states.items():
+        if state_data.get('browser_token') == browser_token:
+            username = user
+            break
 
-    if not pending_data:
-        print("Vérification TOTP échouée: Token invalide ou expiré.")
-        # Ne pas envoyer de SMS ici car on ne sait pas à quel utilisateur l'associer de manière fiable
+    if not username or username not in auth_states or time.time() > auth_states[username]['timestamp'] + STATE_TIMEOUT:
+        print(f"Vérification TOTP échouée: Token navigateur invalide ou état expiré pour token {browser_token}.")
+        # Nettoyer l'état si trouvé mais expiré
+        if username and username in auth_states:
+             del auth_states[username]
         return jsonify({"status": "fail", "message": "Session de vérification expirée ou invalide. Veuillez recommencer la connexion."}), 400
 
-    username = pending_data['username']
-    expected_totp = pending_data['expected_totp']
-    user = users.get(username) # Récupérer les données utilisateur complètes
+    # L'état existe et n'est pas expiré.
+    state_data = auth_states[username]
 
-    if not user:
-         # Cas improbable si pending_data existe mais pas l'utilisateur, mais sécurité
-         print(f"Vérification TOTP échouée pour {username}: Utilisateur introuvable.")
-         del pending_2fa_verifications[auth_token] # Nettoyer l'état
-         recent_auth_status[username] = {'status': 'fail', 'timestamp': time.time()}
-         if user and user.get('phone_number'):
-              send_sms(user['phone_number'], f"Tentative de connexion échouée (utilisateur introuvable) pour votre compte cloud.")
-         return jsonify({"status": "fail", "message": "Erreur interne. Veuillez recommencer la connexion."}), 500
+    # Vérifier si le TOTP a bien été reçu de l'appareil ET si l'état est correct
+    received_totp = state_data.get('received_totp')
+    chosen_device = state_data.get('device')
+
+    if state_data['status'] != 'awaiting_user_totp_entry' or not received_totp or not chosen_device:
+         print(f"Vérification TOTP échouée pour {username}: TOTP de l'appareil non encore reçu, état incorrect ({state_data['status']}), ou appareil non choisi.")
+         # L'utilisateur a soumis le code trop tôt, avant que l'appareil ne l'envoie au serveur, ou il y a une erreur d'état.
+         # Ne pas supprimer l'état, l'utilisateur peut réessayer.
+         return jsonify({"status": "fail", "message": "Le code TOTP de votre appareil n'a pas encore été reçu par le serveur ou l'état est incorrect. Veuillez attendre le SMS et réessayer."}), 400
 
 
-    # Vérifier le TOTP saisi par l'utilisateur par rapport au code attendu
-    # Note: On ne régénère PAS le TOTP ici, on compare avec celui qui a été envoyé par SMS.
-    if totp_code == expected_totp:
+    # Vérifier le TOTP saisi par l'utilisateur ET le nom de l'appareil saisi
+    if totp_code_user_input == received_totp and device_name_user_input == chosen_device:
         # 2FA réussie
         print(f"Vérification TOTP réussie pour {username}.")
-        del pending_2fa_verifications[auth_token] # Nettoyer l'état en attente
-        recent_auth_status[username] = {'status': 'success', 'timestamp': time.time()} # Mettre à jour le statut récent pour les appareils
+        auth_states[username]['status'] = 'success' # Mettre à jour l'état
+        auth_states[username]['timestamp'] = time.time() # Mettre à jour le timestamp pour la durée de la session
         # Envoyer un SMS de connexion réussie
-        if user.get('phone_number'):
+        user = users.get(username)
+        if user and user.get('phone_number'):
              send_sms(user['phone_number'], f"Connexion réussie à votre compte cloud.")
 
         # Retourner le succès au navigateur et l'URL de redirection
         return jsonify({"status": "success", "message": "Vérification 2FA réussie. Redirection vers votre espace cloud...", "redirect_url": url_for('cloud_space', _external=True)}), 200
     else:
-        # TOTP invalide
-        print(f"Vérification TOTP échouée pour {username}: Code invalide.")
-        # Ne pas supprimer l'état pending_2fa_verifications tout de suite pour permettre de réessayer
-        # L'état expirera après PENDING_TIMEOUT.
-        recent_auth_status[username] = {'status': 'fail', 'timestamp': time.time()} # Mettre à jour le statut récent pour les appareils
+        # TOTP ou nom d'appareil invalide
+        print(f"Vérification TOTP échouée pour {username}: Code ({totp_code_user_input}) ou nom d'appareil ({device_name_user_input}) invalide.")
+        auth_states[username]['status'] = 'fail' # Mettre à jour l'état
+        auth_states[username]['timestamp'] = time.time() # Mettre à jour le timestamp pour la durée de l'échec
+        # Ne pas supprimer l'état tout de suite pour permettre aux appareils de le voir.
         # Envoyer un SMS d'échec de 2FA
-        if user.get('phone_number'):
-             send_sms(user['phone_number'], f"Tentative de connexion échouée (code 2FA invalide) pour votre compte cloud.")
-        return jsonify({"status": "fail", "message": "Code TOTP invalide."}), 401
+        user = users.get(username)
+        if user and user.get('phone_number'):
+             send_sms(user['phone_number'], f"Tentative de connexion échouée (code 2FA ou nom d'appareil invalide) pour votre compte cloud.")
+        return jsonify({"status": "fail", "message": "Code TOTP ou nom d'appareil invalide."}), 401
 
-# --- Route pour les appareils IoT pour vérifier le statut ---
+# --- Point de terminaison pour que les appareils soumettent le TOTP ---
+
+@app.route('/submit_device_totp', methods=['POST'])
+def submit_device_totp():
+    # Nettoyer les états expirés
+    cleanup_expired_states()
+
+    data = request.get_json()
+    username = data.get('username')
+    device_type = data.get('device_type') # 'pi' ou 'esp32'
+    totp_code_from_device = data.get('totp')
+    # Optionnel: Inclure un secret partagé ou une signature pour authentifier la requête de l'appareil
+
+    print(f"TOTP reçu de l'appareil {device_type} pour l'utilisateur {username}: {totp_code_from_device}")
+
+    if not username or not device_type or not totp_code_from_device:
+        print("Soumission TOTP échouée: Données manquantes.")
+        return jsonify({"status": "error", "message": "Données manquantes"}), 400
+
+    # Trouver l'état de l'utilisateur
+    state_data = auth_states.get(username)
+    user = users.get(username) # Récupérer les données utilisateur complètes
+
+    # Vérifier si l'utilisateur existe et si une tentative est en attente de TOTP de cet appareil
+    if not user or not state_data or state_data['status'] != 'awaiting_device_totp' or state_data.get('device') != device_type:
+        print(f"Soumission TOTP échouée pour {username} depuis {device_type}: Pas d'état en attente ou appareil incorrect.")
+        # Optionnel: Envoyer un SMS d'alerte si un appareil non attendu soumet un code
+        if user and user.get('phone_number'):
+             send_sms(user['phone_number'], f"Alerte de sécurité: Tentative de soumission TOTP inattendue depuis un appareil ({device_type}) pour votre compte cloud.")
+        return jsonify({"status": "fail", "message": "Aucune tentative de connexion en attente de TOTP de cet appareil"}), 400
+
+    # L'appareil correct a soumis un code alors que le serveur l'attendait
+    # Vérifier si le TOTP soumis par l'appareil est valide (basé sur le secret stocké sur le serveur)
+    # C'est une double vérification. L'appareil génère le code, le serveur le vérifie aussi.
+    totp_server_check = pyotp.TOTP(user['totp_secret'])
+    if not totp_server_check.verify(totp_code_from_device):
+         print(f"Soumission TOTP échouée pour {username} depuis {device_type}: Code TOTP invalide (vérification serveur).")
+         # Mettre l'état en échec
+         auth_states[username]['status'] = 'fail'
+         auth_states[username]['timestamp'] = time.time()
+         if user.get('phone_number'):
+              send_sms(user['phone_number'], f"Tentative de connexion échouée (code 2FA invalide soumis par appareil) pour votre compte cloud.")
+         return jsonify({"status": "fail", "message": "Code TOTP invalide"}), 401
+
+
+    # Le TOTP de l'appareil est valide et attendu
+    print(f"TOTP valide reçu de l'appareil {device_type} pour {username}.")
+    # Stocker le code reçu pour la vérification ultérieure par l'utilisateur
+    auth_states[username]['received_totp'] = totp_code_from_device
+    # Mettre à jour l'état pour indiquer que le serveur attend maintenant la saisie de l'utilisateur
+    auth_states[username]['status'] = 'awaiting_user_totp_entry'
+    auth_states[username]['timestamp'] = time.time() # Mettre à jour le timestamp
+
+    # Envoyer le code TOTP reçu par SMS à l'utilisateur (en mentionnant l'appareil)
+    sms_message = f"Votre code TOTP pour votre compte cloud ({device_type}): {totp_code_from_device}. Saisissez-le sur la page de connexion."
+    send_sms(user['phone_number'], sms_message)
+
+    return jsonify({"status": "success", "message": "TOTP reçu et validé par le serveur. SMS envoyé."}), 200
+
+
+# --- Point de terminaison pour les appareils IoT pour vérifier le statut ---
 
 @app.route('/check_auth_status', methods=['POST'])
 def check_auth_status():
@@ -570,22 +682,46 @@ def check_auth_status():
     if not username or not device_type:
         return jsonify({"status": "error", "message": "Nom d'utilisateur ou type d'appareil manquant"}), 400
 
-    print(f"Requête de statut reçue pour {username} depuis {device_type}")
+    # Mettre à jour le timestamp de la dernière vue pour cet appareil
+    if username not in device_last_seen:
+        device_last_seen[username] = {}
+    device_last_seen[username][device_type] = time.time()
+    # print(f"Appareil {device_type} pour {username} vu à {time.ctime(device_last_seen[username][device_type])}") # Trop verbeux
 
-    # Vérifier le statut récent pour cet utilisateur
-    status_data = recent_auth_status.get(username)
 
-    if status_data:
-        # Si un statut récent existe, le retourner
-        status = status_data['status']
-        print(f"Statut pour {username}: {status}")
-        # Optionnel: Supprimer le statut après qu'un appareil l'ait récupéré pour une seule notification par appareil
-        # del recent_auth_status[username] # Décommenter si vous voulez que chaque appareil ne réagisse qu'une fois
-        return jsonify({"status": status, "message": f"Statut d'authentification: {status}"}), 200
+    # Vérifier l'état pour cet utilisateur
+    state_data = auth_states.get(username)
+
+    if state_data and time.time() < state_data['timestamp'] + STATE_TIMEOUT:
+        # Si un état récent et valide existe, le retourner
+        status = state_data['status']
+        response_data = {"status": status, "message": f"Statut d'authentification: {status}"}
+
+        # Si le serveur attend le TOTP de cet appareil, inclure cette information
+        if status == 'awaiting_device_totp' and state_data.get('device') == device_type:
+             response_data['action'] = 'generate_and_submit_totp'
+             response_data['message'] += f" - Veuillez générer et soumettre le TOTP."
+             print(f"Statut pour {username} ({device_type}): {status} - Action: generate_and_submit_totp")
+        elif status in ['success', 'fail']:
+             response_data['action'] = 'stop_polling' # Indiquer à l'appareil d'arrêter
+             print(f"Statut pour {username} ({device_type}): {status} - Action: stop_polling")
+        else:
+             response_data['action'] = 'wait' # Indiquer à l'appareil d'attendre
+             # print(f"Statut pour {username} ({device_type}): {status} - Action: wait") # Trop verbeux
+
+
+        # Optionnel: Supprimer l'état 'success' ou 'fail' après qu'un appareil l'ait récupéré
+        # pour que les appareils arrêtent de réagir après la première notification.
+        # if status in ['success', 'fail']:
+        #      del auth_states[username]
+        #      print(f"Statut {status} effacé pour {username} après récupération par {device_type}.")
+
+
+        return jsonify(response_data), 200
     else:
-        # Si aucun statut récent, l'utilisateur n'est pas en cours d'authentification ou le statut a expiré
-        print(f"Aucun statut récent pour {username}. Statut: not_authenticated")
-        return jsonify({"status": "not_authenticated", "message": "Aucun statut d'authentification récent"}), 200 # Retourner 200 même si pas authentifié, ce n'est pas une erreur
+        # Si aucun état récent, l'utilisateur n'est pas en cours d'authentification ou l'état a expiré
+        # print(f"Aucun état récent pour {username}. Statut: not_authenticated") # Trop verbeux
+        return jsonify({"status": "not_authenticated", "message": "Aucun statut d'authentification récent", "action": "wait"}), 200 # Retourner 200 même si pas authentifié, ce n'est pas une erreur
 
 # --- Route pour l'espace cloud (protégée temporairement) ---
 
@@ -605,18 +741,18 @@ def cloud_space():
     # NOTE: Ceci est une simplification majeure de sécurité.
     authenticated_user = None
     current_time = time.time()
-    # Parcourir les statuts récents pour trouver un succès non expiré
-    for user, data in list(recent_auth_status.items()): # Utiliser list() car le dict peut être modifié pendant l'itération
-        if data['status'] == 'success' and current_time < data['timestamp'] + STATUS_TIMEOUT:
+    # Parcourir les états pour trouver un succès non expiré
+    for user, state_data in list(auth_states.items()): # Utiliser list() car le dict peut être modifié pendant l'itération
+        if state_data['status'] == 'success' and current_time < state_data['timestamp'] + STATE_TIMEOUT:
             authenticated_user = user
             break # Trouver le premier utilisateur authentifié temporairement
 
     if authenticated_user:
         # Afficher la page de l'espace cloud
-        # Optionnel: Effacer le statut de succès après l'accès (pour une seule utilisation)
-        # if authenticated_user in recent_auth_status:
-        #      del recent_auth_status[authenticated_user]
-        #      print(f"Statut de succès effacé pour {authenticated_user} après accès à l'espace cloud.")
+        # Optionnel: Effacer l'état de succès après l'accès (pour une seule utilisation)
+        # if authenticated_user in auth_states:
+        #      del auth_states[authenticated_user]
+        #      print(f"État de succès effacé pour {authenticated_user} après accès à l'espace cloud.")
 
         return render_template_string(f'''
             <!DOCTYPE html>
