@@ -1,6 +1,7 @@
 # app.py
-from flask import Flask, request, jsonify, render_template_string, redirect, url_for
+from flask import Flask, request, jsonify, render_template_string, redirect, url_for, session # Ajout de session
 from werkzeug.security import generate_password_hash, check_password_hash
+# import pyotp # Plus nécessaire pour ce flux spécifique
 import base64
 import os
 import json
@@ -9,300 +10,248 @@ import random
 # Importer la bibliothèque Twilio (assurez-vous de l'installer: pip install twilio)
 from twilio.rest import Client
 import uuid # Pour générer des tokens uniques
-import logging # Pour une journalisation plus robuste
 
 app = Flask(__name__)
-# Clé secrète pour sécuriser les sessions Flask (même si non utilisées ici, bonne pratique)
-# Utilisez une variable d'environnement en production! Pour test local rapide:
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'une_cle_tres_secrete_par_defaut') # À changer!
-
-# --- Configuration de la Journalisation (Logging) ---
-# Configurer le niveau de journalisation (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-app.logger.setLevel(logging.DEBUG) # Définir le niveau de journalisation
-# Créer un gestionnaire de fichiers (pour écrire les logs dans un fichier)
-file_handler = logging.FileHandler('app.log')
-file_handler.setLevel(logging.DEBUG)
-# Créer un formatteur (pour définir le format des messages de log)
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-file_handler.setFormatter(formatter)
-# Ajouter le gestionnaire de fichiers à l'application Flask
-app.logger.addHandler(file_handler)
+# Clé secrète pour sécuriser les sessions Flask
+# Utilisez une variable d'environnement en production!
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'une_cle_tres_secrete_par_defaut_a_changer')
 
 # --- Configuration Twilio ---
-# Utilisez des variables d'environnement pour les identifiants Twilio sur Render
-# Pour test local rapide, vous pouvez les mettre ici (PAS EN PRODUCTION!)
-TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID') # Remplacez par votre SID
-TWILIO_AUTH_TOKEN = os.environ.get('TWILIO_AUTH_TOKEN') # Remplacez par votre Auth Token
-TWILIO_PHONE_NUMBER = os.environ.get('TWILIO_PHONE_NUMBER') # Remplacez par votre numéro Twilio
+TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID')
+TWILIO_AUTH_TOKEN = os.environ.get('TWILIO_AUTH_TOKEN')
+TWILIO_PHONE_NUMBER = os.environ.get('TWILIO_PHONE_NUMBER')
 
-# Initialiser le client Twilio (sera None si les variables d'env ne sont pas définies)
 twilio_client = None
-if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_PHONE_NUMBER:
     try:
         twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        app.logger.info("Client Twilio initialisé.")
+        print("Client Twilio initialisé.")
     except Exception as e:
-        app.logger.error(f"Erreur lors de l'initialisation du client Twilio: {e}")
-        twilio_client = None # S'assurer qu'il est None en cas d'erreur
+        print(f"Erreur lors de l'initialisation du client Twilio: {e}")
+else:
+    print("Variables d'environnement Twilio manquantes. L'envoi de SMS sera désactivé.")
 
 def send_sms(to_phone_number, message_body):
-    """Envoie un SMS via Twilio."""
-    if twilio_client and TWILIO_PHONE_NUMBER and to_phone_number:
-        try:
-            message = twilio_client.messages.create(
-                to=to_phone_number,
-                from_=TWILIO_PHONE_NUMBER,
-                body=message_body
-            )
-            app.logger.info(f"SMS envoyé à {to_phone_number}: {message_body}")
-            return True
-        except Exception as e:
-            app.logger.error(f"Échec de l'envoi du SMS à {to_phone_number}: {e}")
-            return False
-    else:
-        app.logger.warning("Client Twilio non configuré, numéro Twilio manquant ou numéro destinataire manquant. SMS non envoyé.")
+    if not twilio_client:
+        print(f"Client Twilio non initialisé. Simulation d'envoi SMS à {to_phone_number}: {message_body}")
+        # Pour le test sans Twilio configuré, on simule un succès
+        return True
+    if not to_phone_number:
+        print("Numéro de téléphone destinataire manquant. SMS non envoyé.")
+        return False
+    try:
+        message = twilio_client.messages.create(
+            to=to_phone_number,
+            from_=TWILIO_PHONE_NUMBER,
+            body=message_body
+        )
+        print(f"SMS envoyé à {to_phone_number} (SID: {message.sid})")
+        return True
+    except Exception as e:
+        print(f"Échec de l'envoi du SMS à {to_phone_number}: {e}")
         return False
 
 # --- Configuration du fichier JSON ---
-JSON_FILE_PATH = 'users.json' # Nom du fichier pour stocker les utilisateurs
+JSON_FILE_PATH = 'users.json'
 
 def load_users():
-    """Charge les données des utilisateurs depuis le fichier JSON."""
     if os.path.exists(JSON_FILE_PATH):
         try:
             with open(JSON_FILE_PATH, 'r') as f:
                 data = json.load(f)
-                # S'assurer que les champs nécessaires existent pour les anciens utilisateurs
                 for user_data in data.values():
-                     if 'enabled_devices' not in user_data or not isinstance(user_data['enabled_devices'], list):
-                         user_data['enabled_devices'] = []
-                     if 'phone_number' not in user_data:
-                         user_data['phone_number'] = None
+                    user_data.setdefault('enabled_devices', [])
+                    user_data.setdefault('phone_number', None)
+                    # totp_secret n'est plus utilisé dans ce flux
+                    user_data.pop('totp_secret', None)
                 return data
-        except json.JSONDecodeError:
-            # Gérer le cas où le fichier JSON est vide ou corrompu
-            app.logger.warning("Fichier users.json vide ou corrompu. Retour d'un dictionnaire vide.")
+        except (json.JSONDecodeError, Exception) as e:
+            print(f"Erreur lors du chargement de {JSON_FILE_PATH}: {e}. Utilisation d'un dictionnaire vide.")
             return {}
-        except Exception as e:
-            app.logger.error(f"Erreur lors du chargement de users.json: {e}")
-            return {}
-    else:
-        # Si le fichier n'existe pas, retourner un dictionnaire vide
-        return {}
+    return {}
 
 def save_users(users_data):
-    """Sauvegarde les données des utilisateurs dans le fichier JSON."""
     try:
         with open(JSON_FILE_PATH, 'w') as f:
-            json.dump(users_data, f, indent=4) # Utiliser indent pour une meilleure lisibilité
+            json.dump(users_data, f, indent=4)
     except Exception as e:
-        app.logger.error(f"Erreur lors de la sauvegarde de users.json: {e}")
+        print(f"Erreur lors de la sauvegarde de {JSON_FILE_PATH}: {e}")
 
-# Charger les utilisateurs au démarrage de l'application
-# ATTENTION: Sur les services gratuits comme Render, ce fichier peut être réinitialisé
-# à chaque redémarrage du service, entraînant la perte des utilisateurs enregistrés.
 users = load_users()
-app.logger.info(f"Chargé {len(users)} utilisateurs depuis {JSON_FILE_PATH}")
+print(f"Chargé {len(users)} utilisateurs depuis {JSON_FILE_PATH}")
 
 # --- Gestion de l'état d'authentification temporaire ---
-# Stocke les tentatives de connexion en attente de code
-# {username: {'code': '...', 'browser_token': '...', 'timestamp': '...'}}
+# {username: {'status': '...', 'device_expected': '...', 'received_device_code': '...', 'sms_sent': bool, 'timestamp': '...'}}
+# Status: 'password_correct', 'awaiting_device_code', 'awaiting_sms_verification', 'success', 'fail'
 auth_states = {}
-STATE_TIMEOUT = 300 # Durée de validité d'un état en secondes (5 minutes)
+STATE_TIMEOUT = 300 # 5 minutes
 
 def cleanup_expired_states():
-    """Nettoie les états d'authentification temporaires expirés."""
     current_time = time.time()
-    expired_users = [username for username, data in auth_states.items() if current_time > data['timestamp'] + STATE_TIMEOUT]
+    expired_users = [username for username, data in list(auth_states.items()) if current_time > data['timestamp'] + STATE_TIMEOUT]
     for username in expired_users:
-        app.logger.info(f"Nettoyage de l'état expiré pour {username} (en attente de code).")
-        del auth_states[username]
+        print(f"Nettoyage de l'état expiré pour {username}")
+        if username in auth_states:
+             del auth_states[username]
 
-# --- Routes pour l'interface utilisateur ---
+# --- Routes --- #
 
 @app.route('/')
 def index():
-    # Page de login avec lien vers l'inscription
+    # Page de login
     return render_template_string('''
-        <!DOCTYPE html>
-        <html lang="fr">
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Connexion au Compte Cloud</title>
-            <!-- Bootstrap CSS -->
-            <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-            <style>
-                body {
-                    background-color: #f8f9fa;
-                }
-                .container {
-                    max-width: 400px;
-                    margin-top: 50px;
-                    padding: 20px;
-                    background-color: #ffffff;
-                    border-radius: 8px;
-                    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
-                }
-                h1, h2 {
-                    text-align: center;
-                    margin-bottom: 20px;
-                }
-                .form-label {
-                    font-weight: bold;
-                }
-                .alert {
-                    margin-top: 20px;
-                }
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <h1>Accès au Compte Cloud</h1>
-                <h2>Connexion</h2>
-                <form action="/login" method="post">
-                    <div class="mb-3">
-                        <label for="username" class="form-label">Nom d'utilisateur:</label>
-                        <input type="text" class="form-control" id="username" name="username" required>
-                    </div>
-                    <div class="mb-3">
-                        <label for="password" class="form-label">Mot de passe:</label>
-                        <input type="password" class="form-control" id="password" name="password" required>
-                    </div>
-                    <button type="submit" class="btn btn-primary w-100">Se Connecter</button>
-                </form>
-                <p class="text-center mt-3"><a href="/register">Nouvel utilisateur? S'inscrire ici.</a></p>
-                <div id="login-status" class="alert d-none" role="alert"></div>
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Connexion</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style> body { background-color: #f8f9fa; } .container { max-width: 400px; margin-top: 50px; padding: 20px; background-color: #fff; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); } </style>
+</head>
+<body>
+    <div class="container">
+        <h1 class="text-center mb-4">Connexion</h1>
+        <form id="login-form" action="/login" method="post">
+            <div class="mb-3">
+                <label for="username" class="form-label">Nom d'utilisateur:</label>
+                <input type="text" class="form-control" id="username" name="username" required>
             </div>
+            <div class="mb-3">
+                <label for="password" class="form-label">Mot de passe:</label>
+                <input type="password" class="form-control" id="password" name="password" required>
+            </div>
+            <button type="submit" class="btn btn-primary w-100">Se Connecter</button>
+        </form>
+        <p class="text-center mt-3">Nouveau? <a href="/register">S'inscrire ici</a>.</p>
+        <div id="login-status" class="alert d-none mt-3" role="alert"></div>
+    </div>
+    <script>
+        document.getElementById('login-form').addEventListener('submit', async function(event) {
+            event.preventDefault();
+            const form = event.target;
+            const formData = new FormData(form);
+            const statusDiv = document.getElementById('login-status');
+            statusDiv.classList.add('d-none'); // Cacher l'ancien statut
 
-            <!-- Bootstrap JS (optionnel, pour certains composants Bootstrap) -->
-            <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
-            <script>
-                // Script client-side pour afficher le statut de connexion
-                document.querySelector('form[action="/login"]').addEventListener('submit', async function(event) {
-                    event.preventDefault();
-                    const form = event.target;
-                    const formData = new FormData(form);
-                    const response = await fetch(form.action, {
-                        method: form.method,
-                        body: formData
-                    });
-                    const result = await response.json();
-                    const statusDiv = document.getElementById('login-status');
-
-                    // Afficher le message
-                    statusDiv.innerText = result.message;
-                    statusDiv.classList.remove('d-none', 'alert-success', 'alert-danger', 'alert-info'); // Nettoyer les classes précédentes
-
-                    if (result.status === 'fail') {
-                        statusDiv.classList.add('alert-danger'); // Rouge pour échec
-                    } else if (result.status === 'code_required') {
-                         statusDiv.classList.add('alert-info'); // Bleu pour info/attente
-                    }
-                     statusDiv.classList.remove('d-none'); // Rendre visible
-
-                    if (result.status === 'code_required' && result.redirect_url) {
-                        // Si code requise, rediriger vers la page de saisie du code
-                        // Ajouter un petit délai pour que l'utilisateur lise le message
-                        setTimeout(() => {
-                            window.location.href = result.redirect_url;
-                        }, 2000); // Rediriger après 2 secondes
-                    }
+            try {
+                const response = await fetch(form.action, {
+                    method: form.method,
+                    body: formData
                 });
-            </script>
-        </body>
-        </html>
+                const result = await response.json();
+
+                statusDiv.textContent = result.message;
+                statusDiv.classList.remove('d-none', 'alert-success', 'alert-danger', 'alert-info');
+
+                if (result.status === 'success') {
+                    statusDiv.classList.add('alert-success');
+                    // Redirection vers une page de succès ou tableau de bord
+                    // window.location.href = '/dashboard'; // Exemple
+                } else if (result.status === 'awaiting_device_code') {
+                    statusDiv.classList.add('alert-info');
+                    // Pas de redirection ici, l'utilisateur attend l'action de l'appareil
+                    // On pourrait ajouter un indicateur d'attente
+                } else if (result.status === 'redirect_to_sms_verify') {
+                     statusDiv.classList.add('alert-info');
+                     // Rediriger vers la page de vérification SMS après un court délai
+                     setTimeout(() => {
+                         window.location.href = result.redirect_url;
+                     }, 1500);
+                } else {
+                    statusDiv.classList.add('alert-danger');
+                }
+            } catch (error) {
+                console.error('Erreur lors de la connexion:', error);
+                statusDiv.textContent = 'Une erreur est survenue.';
+                statusDiv.classList.remove('d-none');
+                statusDiv.classList.add('alert-danger');
+            }
+        });
+    </script>
+</body>
+</html>
     ''')
 
 @app.route('/register')
 def register_page():
     # Page d'inscription
     return render_template_string('''
-        <!DOCTYPE html>
-        <html lang="fr">
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Inscription</title>
-            <!-- Bootstrap CSS -->
-            <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-             <style>
-                body {
-                    background-color: #f8f9fa;
-                }
-                .container {
-                    max-width: 500px;
-                    margin-top: 50px;
-                    padding: 20px;
-                    background-color: #ffffff;
-                    border-radius: 8px;
-                    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
-                }
-                h1, h2 {
-                    text-align: center;
-                    margin-bottom: 20px;
-                }
-                 .form-label {
-                    font-weight: bold;
-                }
-                 .alert {
-                    margin-top: 20px;
-                 }
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <h1>Inscription</h1>
-                <form action="/register" method="post">
-                    <div class="mb-3">
-                        <label for="username" class="form-label">Nom d'utilisateur:</label>
-                        <input type="text" class="form-control" id="username" name="username" required>
-                    </div>
-                    <div class="mb-3">
-                        <label for="password" class="form-label">Mot de passe:</label>
-                        <input type="password" class="form-control" id="password" name="password" required>
-                    </div>
-                     <div class="mb-3">
-                        <label for="phone_number" class="form-label">Numéro de téléphone (pour SMS, format +12223334444):</label>
-                        <input type="text" class="form-control" id="phone_number" name="phone_number">
-                         <small class="form-text text-muted">Requis pour recevoir les codes et les alertes.</small>
-                    </div>
-                    <button type="submit" class="btn btn-success w-100">S'inscrire</button>
-                </form>
-                <p class="text-center mt-3"><a href="/">Retour à la connexion.</a></p>
-                <div id="register-status" class="alert d-none" role="alert"></div>
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Inscription</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style> body { background-color: #f8f9fa; } .container { max-width: 500px; margin-top: 50px; padding: 20px; background-color: #fff; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); } </style>
+</head>
+<body>
+    <div class="container">
+        <h1 class="text-center mb-4">Inscription</h1>
+        <form id="register-form" action="/register" method="post">
+            <div class="mb-3">
+                <label for="username" class="form-label">Nom d'utilisateur:</label>
+                <input type="text" class="form-control" id="username" name="username" required>
             </div>
+            <div class="mb-3">
+                <label for="password" class="form-label">Mot de passe:</label>
+                <input type="password" class="form-control" id="password" name="password" required>
+            </div>
+            <div class="mb-3">
+                <label for="phone_number" class="form-label">Numéro de téléphone (format +33xxxxxxxxx):</label>
+                <input type="tel" class="form-control" id="phone_number" name="phone_number" required pattern="\+[0-9]{10,15}">
+                <small class="form-text text-muted">Requis pour recevoir le code de vérification par SMS.</small>
+            </div>
+            <div class="mb-3">
+                <label class="form-label">Choisissez vos dispositifs 2FA (au moins un):</label><br>
+                <div class="form-check form-check-inline">
+                    <input class="form-check-input" type="checkbox" id="device_pi" name="device" value="pi">
+                    <label class="form-check-label" for="device_pi">Raspberry Pi</label>
+                </div>
+                <div class="form-check form-check-inline">
+                    <input class="form-check-input" type="checkbox" id="device_esp32" name="device" value="esp32">
+                    <label class="form-check-label" for="device_esp32">ESP32</label>
+                </div>
+            </div>
+            <button type="submit" class="btn btn-success w-100">S'inscrire</button>
+        </form>
+        <p class="text-center mt-3">Déjà inscrit? <a href="/">Se connecter</a>.</p>
+        <div id="register-status" class="alert d-none mt-3" role="alert"></div>
+    </div>
+    <script>
+        document.getElementById('register-form').addEventListener('submit', async function(event) {
+            event.preventDefault();
+            const form = event.target;
+            const formData = new FormData(form);
+            const statusDiv = document.getElementById('register-status');
+            statusDiv.classList.add('d-none');
 
-            <!-- Bootstrap JS (optionnel) -->
-            <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
-            <script>
-                // Script client-side pour afficher le statut d'inscription
-                document.querySelector('form[action="/register"]').addEventListener('submit', async function(event) {
-                    event.preventDefault();
-                    const form = event.target;
-                    const formData = new FormData(form);
-                    const response = await fetch(form.action, {
-                        method: form.method,
-                        body: formData
-                    });
-                    const result = await response.json();
-                    const statusDiv = document.getElementById('register-status');
-
-                    statusDiv.innerText = result.message;
-                    statusDiv.classList.remove('d-none', 'alert-success', 'alert-danger'); // Nettoyer les classes précédentes
-
-                    if (response.ok) {
-                        statusDiv.classList.add('alert-success'); // Vert pour succès
-                    } else {
-                        statusDiv.classList.add('alert-danger'); // Rouge pour échec
-                    }
-                    statusDiv.classList.remove('d-none'); // Rendre visible
+            try {
+                const response = await fetch(form.action, {
+                    method: form.method,
+                    body: formData
                 });
-            </script>
-        </body>
-        </html>
+                const result = await response.json();
+                statusDiv.textContent = result.message;
+                statusDiv.classList.remove('d-none', 'alert-success', 'alert-danger');
+                if (response.ok) {
+                    statusDiv.classList.add('alert-success');
+                    form.reset(); // Vider le formulaire en cas de succès
+                } else {
+                    statusDiv.classList.add('alert-danger');
+                }
+            } catch (error) {
+                console.error('Erreur lors de l'inscription:', error);
+                statusDiv.textContent = 'Une erreur est survenue.';
+                statusDiv.classList.remove('d-none');
+                statusDiv.classList.add('alert-danger');
+            }
+        });
+    </script>
+</body>
+</html>
     ''')
-
 
 @app.route('/register', methods=['POST'])
 def register():
@@ -310,317 +259,346 @@ def register():
     username = request.form.get('username')
     password = request.form.get('password')
     phone_number = request.form.get('phone_number')
+    enabled_devices = request.form.getlist('device') # Récupère la liste des appareils cochés
 
-    if not username or not password:
-        app.logger.warning("Tentative d'inscription échouée: Nom d'utilisateur et mot de passe requis.")
-        return jsonify({"message": "Nom d'utilisateur et mot de passe requis"}), 400
+    if not username or not password or not phone_number:
+        return jsonify({'message': 'Nom d'utilisateur, mot de passe et numéro de téléphone requis.'}), 400
+
+    # Validation simple du format du numéro (commence par + et suivi de chiffres)
+    if not phone_number.startswith('+') or not phone_number[1:].isdigit():
+         return jsonify({'message': 'Format du numéro de téléphone invalide (doit commencer par + suivi de chiffres).'}), 400
+
+    if not enabled_devices:
+        return jsonify({'message': 'Veuillez sélectionner au moins un dispositif 2FA.'}), 400
 
     if username in users:
-        app.logger.warning(f"Tentative d'inscription échouée: Nom d'utilisateur déjà existant: {username}.")
-        return jsonify({"message": "Nom d'utilisateur déjà existant"}), 409
+        return jsonify({'message': 'Nom d'utilisateur déjà pris.'}), 409
 
+    hashed_password = generate_password_hash(password)
     users[username] = {
-        'password_hash': generate_password_hash(password),
-        'phone_number': phone_number if phone_number else None
+        'password_hash': hashed_password,
+        'phone_number': phone_number,
+        'enabled_devices': enabled_devices
     }
     save_users(users)
-    app.logger.info(f"Utilisateur {username} enregistré.")
-    return jsonify({"message": "Utilisateur enregistré avec succès."}), 201
+    print(f"Utilisateur {username} enregistré avec les appareils: {enabled_devices}")
+    return jsonify({'message': f'Utilisateur {username} enregistré avec succès.'}), 201
 
 @app.route('/login', methods=['POST'])
 def login():
-    # Nettoyer les états expirés avant de traiter la nouvelle tentative
+    global users, auth_states
     cleanup_expired_states()
 
     username = request.form.get('username')
     password = request.form.get('password')
 
-    user = users.get(username)
+    if not username or not password:
+        return jsonify({'status': 'fail', 'message': 'Nom d'utilisateur et mot de passe requis.'}), 400
 
-    if not user or not check_password_hash(user['password_hash'], password):
-        # Échec de la vérification du mot de passe
-        app.logger.warning(f"Échec de connexion (mot de passe) pour {username}: Identifiants invalides.")
-        # Envoyer un SMS d'échec de tentative de connexion
-        if user and user.get('phone_number'): # Envoyer SMS seulement si l'utilisateur existe et a un numéro
-             send_sms(user['phone_number'], f"Tentative de connexion échouée pour votre compte cloud avec le nom d'utilisateur {username}.")
-        elif not user:
-             app.logger.warning(f"Tentative de connexion échouée pour utilisateur inconnu: {username}")
+    user_data = users.get(username)
+    if not user_data or not check_password_hash(user_data['password_hash'], password):
+        return jsonify({'status': 'fail', 'message': 'Identifiants incorrects.'}), 401
 
-        # Retourner l'échec au navigateur
-        return jsonify({"status": "fail", "message": "Nom d'utilisateur ou mot de passe invalide"}), 401
-    else:
-        # Mot de passe correct. Générer un code et attendre la soumission.
-        app.logger.info(f"Mot de passe correct pour {username}. Génération d'un code et envoi par SMS.")
+    # Identifiants corrects, passer à l'étape 2FA
+    enabled_devices = user_data.get('enabled_devices', [])
+    if not enabled_devices:
+         # Cas où l'utilisateur est enregistré mais sans appareil (ne devrait pas arriver avec la validation à l'inscription)
+         print(f"Avertissement: Utilisateur {username} sans appareil 2FA configuré.")
+         return jsonify({'status': 'fail', 'message': 'Aucun appareil 2FA configuré pour ce compte.'}), 403
 
-        # Générer un code aléatoire
-        random_code = str(random.randint(100000, 999999))
+    # Pour cet exemple, on prend le premier appareil activé (ex: 'esp32')
+    # Une logique plus complexe pourrait demander à l'utilisateur de choisir si plusieurs sont actifs
+    device_to_use = enabled_devices[0]
 
-        # Créer un token unique pour cette tentative
-        auth_token = str(uuid.uuid4())
+    # Générer un token unique pour cette tentative de connexion
+    # browser_token = str(uuid.uuid4())
 
-        # Stocker les informations de la tentative en attente
-        auth_states[username] = {
-            'status': 'awaiting_code',
-            'code': random_code,
-            'browser_token': auth_token,
-            'timestamp': time.time()
-        }
+    # Stocker l'état d'authentification
+    auth_states[username] = {
+        'status': 'awaiting_device_code',
+        'device_expected': device_to_use,
+        'received_device_code': None,
+        'sms_sent': False,
+        # 'browser_token': browser_token, # On utilisera la session Flask plutôt
+        'timestamp': time.time()
+    }
 
-        # Envoyer le code à l'utilisateur par SMS
-        sms_message = f"Votre code de connexion pour votre compte cloud: {random_code}. Saisissez-le sur la page de connexion."
-        if user.get('phone_number'):
-            if send_sms(user['phone_number'], sms_message):
-                app.logger.info(f"SMS envoyé avec succès à {username} pour la vérification du code.")
-            else:
-                app.logger.error(f"Échec de l'envoi du SMS à {username} pour la vérification du code.")
-        else:
-            app.logger.warning(f"Impossible d'envoyer le SMS à {username}: numéro de téléphone manquant.")
+    # Stocker le username dans la session pour le retrouver plus tard
+    session['username'] = username
+    session['login_attempt_time'] = time.time() # Pour vérifier la fraîcheur de la tentative
 
-        # Rediriger le navigateur vers la page de saisie du code avec le token
-        redirect_url = url_for('verify_code_page', token=auth_token, _external=True)
-        app.logger.debug(f"URL de redirection: {redirect_url}")
-        return jsonify({"status": "code_required", "message": "Mot de passe correct. Un code a été envoyé par SMS. Veuillez le saisir.", "redirect_url": redirect_url}), 200
+    print(f"Login étape 1 réussie pour {username}. En attente du code de l'appareil {device_to_use}.")
+    # Informer l'utilisateur qu'il doit attendre le code de son appareil
+    return jsonify({
+        'status': 'awaiting_device_code',
+        'message': f'Identifiants corrects. Veuillez attendre le code de vérification de votre appareil ({device_to_use})...',
+        # 'browser_token': browser_token # Pas besoin si on utilise la session
+    }), 200
 
-@app.route('/verify_code_page')
-def verify_code_page():
-    # Page pour saisir le code
-    auth_token = request.args.get('token')
-    app.logger.debug(f"Accès à /verify_code_page avec token: {auth_token}")
-
-    if not auth_token or auth_token not in auth_states:
-        app.logger.warning("Requête invalide ou expirée pour la vérification du code.")
-        return "Requête invalide ou expirée.", 400 # Gérer les tokens manquants ou invalides
-
-    # Afficher le formulaire de saisie du code
-    return render_template_string('''
-        <!DOCTYPE html>
-        <html lang="fr">
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Vérification du Code</title>
-            <!-- Bootstrap CSS -->
-            <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-             <style>
-                body {
-                    background-color: #f8f9fa;
-                }
-                .container {
-                    max-width: 400px;
-                    margin-top: 50px;
-                    padding: 20px;
-                    background-color: #ffffff;
-                    border-radius: 8px;
-                    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
-                }
-                h1, h2 {
-                    text-align: center;
-                    margin-bottom: 20px;
-                }
-                 .form-label {
-                    font-weight: bold;
-                }
-                 .alert {
-                    margin-top: 20px;
-                }
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <h1>Vérification du Code</h1>
-                <p class="text-center">Veuillez saisir le code reçu par SMS.</p>
-                <form action="/verify_code" method="post">
-                    <input type="hidden" name="token" value="{{ token }}">
-                    <div class="mb-3">
-                         <label for="code" class="form-label">Code:</label>
-                         <input type="text" class="form-control" id="code" name="code" required>
-                    </div>
-                    <button type="submit" class="btn btn-primary w-100">Vérifier le Code</button>
-                </form>
-                <div id="verification-status" class="alert d-none" role="alert"></div>
-            </div>
-
-            <!-- Bootstrap JS (optionnel) -->
-            <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
-            <script>
-                // Script client-side pour afficher le statut de vérification
-                document.querySelector('form[action="/verify_code"]').addEventListener('submit', async function(event) {
-                    event.preventDefault();
-                    const form = event.target;
-                    const formData = new FormData(form);
-                    const response = await fetch(form.action, {
-                        method: form.method,
-                        body: formData
-                    });
-                    const result = await response.json();
-                    const statusDiv = document.getElementById('verification-status');
-
-                    statusDiv.innerText = result.message;
-                    statusDiv.classList.remove('d-none', 'alert-success', 'alert-danger'); // Nettoyer les classes précédentes
-
-                    if (result.status === 'success') {
-                        statusDiv.classList.add('alert-success'); // Vert pour succès
-                         // Rediriger après un petit délai
-                         setTimeout(() => {
-                            window.location.href = result.redirect_url;
-                        }, 2000); // Rediriger après 2 secondes
-                    } else {
-                        statusDiv.classList.add('alert-danger'); // Rouge pour échec
-                        // Si échec, l'utilisateur peut réessayer si la tentative n'a pas expiré.
-                    }
-                    statusDiv.classList.remove('d-none'); // Rendre visible
-                });
-            </script>
-        </body>
-        </html>
-    ''', token=auth_token) # Passer le token au template
-
-@app.route('/verify_code', methods=['POST'])
-def verify_code():
-    # Nettoyer les états expirés
+# NOUVELLE ROUTE pour recevoir le code de l'appareil (ESP32/Pi)
+@app.route('/submit_device_code', methods=['POST'])
+def submit_device_code():
+    global auth_states, users
     cleanup_expired_states()
 
-    browser_token = request.form.get('token')
-    code_user_input = request.form.get('code')
-
-    # Récupérer les données de la tentative en attente
-    state_data = auth_states.get(browser_token)
-
-    if not state_data:
-        app.logger.warning("Vérification du code échouée: Token invalide ou expiré.")
-        # Ne pas envoyer de SMS ici car on ne sait pas à quel utilisateur l'associer de manière fiable
-        return jsonify({"status": "fail", "message": "Session de vérification expirée ou invalide. Veuillez recommencer la connexion."}), 400
-
-    username = state_data['username']
-    expected_code = state_data['code']
-    user = users.get(username) # Récupérer les données utilisateur complètes
-
-    if not user:
-         # Cas improbable si state_data existe mais pas l'utilisateur, mais sécurité
-         app.logger.error(f"Vérification du code échouée pour {username}: Utilisateur introuvable.")
-         del auth_states[browser_token] # Nettoyer l'état
-         # recent_auth_status[username] = {'status': 'fail', 'timestamp': time.time()} # Pas de statut pour les appareils ici
-         if user and user.get('phone_number'):
-              send_sms(user['phone_number'], f"Tentative de connexion échouée (utilisateur introuvable) pour votre compte cloud.")
-         return jsonify({"status": "fail", "message": "Erreur interne. Veuillez recommencer la connexion."}), 500
-
-
-    # Vérifier le code saisi par l'utilisateur par rapport au code attendu
-    if code_user_input == expected_code:
-        # Vérification réussie
-        app.logger.info(f"Vérification du code réussie pour {username}.")
-        auth_states[browser_token]['status'] = 'success' # Mettre à jour l'état
-        auth_states[browser_token]['timestamp'] = time.time() # Mettre à jour le timestamp pour la durée de la session
-        # Envoyer un SMS de connexion réussie
-        if user.get('phone_number'):
-             send_sms(user['phone_number'], f"Connexion réussie à votre compte cloud.")
-
-        # Retourner le succès au navigateur et l'URL de redirection
-        return jsonify({"status": "success", "message": "Vérification réussie. Redirection vers votre espace cloud...", "redirect_url": url_for('cloud_space', _external=True)}), 200
-    else:
-        # Code invalide
-        app.logger.warning(f"Vérification du code échouée pour {username}: Code invalide.")
-        # Ne pas supprimer l'état pending_2fa_verifications tout de suite pour permettre de réessayer
-        # L'état expirera après PENDING_TIMEOUT.
-        # recent_auth_status[username] = {'status': 'fail', 'timestamp': time.time()} # Pas de statut pour les appareils ici
-        # Envoyer un SMS d'échec
-        if user.get('phone_number'):
-             send_sms(user['phone_number'], f"Tentative de connexion échouée (code invalide) pour votre compte cloud.")
-        return jsonify({"status": "fail", "message": "Code invalide."}), 401
-
-# --- Nouveau point de terminaison pour que les appareils soumettent le code ---
-
-@app.route('/submit_code', methods=['POST'])
-def submit_code():
     data = request.get_json()
+    if not data:
+        return jsonify({'message': 'Requête invalide (JSON attendu).'}), 400
+
     username = data.get('username')
     device_type = data.get('device_type')
     code = data.get('code')
 
-    app.logger.info(f"Code reçu de l'appareil {device_type} pour l'utilisateur {username}: {code}")
+    if not username or not device_type or not code:
+        return jsonify({'message': 'Données manquantes (username, device_type, code).'}), 400
 
-    # Trouver l'état de l'utilisateur
-    state_data = auth_states.get(username)
-    user = users.get(username)
+    print(f"Code reçu de l'appareil {device_type} pour l'utilisateur {username}: {code}")
 
-    # Vérifier si l'utilisateur existe et si une tentative est en attente
-    if not user or not state_data or state_data['status'] != 'awaiting_code':
-        app.logger.warning(f"Soumission du code échouée pour {username} depuis {device_type}: Pas d'état en attente.")
-        return jsonify({"status": "fail", "message": "Pas de tentative de connexion en attente"}), 400
+    # Vérifier si une tentative de connexion est en cours pour cet utilisateur
+    if username not in auth_states:
+        print(f"Aucune tentative de connexion active trouvée pour {username}.")
+        return jsonify({'message': 'Aucune tentative de connexion active.'}), 404
 
-    # Stocker le code reçu
-    state_data['code'] = code
-    app.logger.info(f"Code stocké pour {username}.")
-    return jsonify({"status": "success", "message": "Code reçu et stocké par le serveur."}), 200
+    current_state = auth_states[username]
 
-# --- Route pour l'espace cloud (protégée temporairement) ---
+    # Vérifier si on attend bien un code de cet appareil
+    if current_state['status'] != 'awaiting_device_code':
+        print(f"État inattendu ({current_state['status']}) pour {username} lors de la réception du code appareil.")
+        return jsonify({'message': 'État de connexion inattendu.'}), 409 # Conflict
 
-@app.route('/cloud_space')
-def cloud_space():
-    # Nettoyer les états expirés
+    if current_state['device_expected'] != device_type:
+        print(f"Appareil inattendu ({device_type}) pour {username}. Attendu: {current_state['device_expected']}.")
+        return jsonify({'message': 'Type d'appareil incorrect.'}), 400
+
+    # Stocker le code reçu et mettre à jour l'état
+    current_state['received_device_code'] = str(code) # S'assurer que c'est une chaîne
+    current_state['status'] = 'awaiting_sms_verification'
+    current_state['timestamp'] = time.time() # Rafraîchir le timestamp
+
+    # Récupérer le numéro de téléphone de l'utilisateur
+    user_data = users.get(username)
+    if not user_data or not user_data.get('phone_number'):
+        print(f"Numéro de téléphone introuvable pour {username}. Impossible d'envoyer le SMS.")
+        # Annuler l'état car on ne peut pas continuer
+        del auth_states[username]
+        return jsonify({'message': 'Erreur interne: Numéro de téléphone manquant.'}), 500
+
+    phone_number = user_data['phone_number']
+    sms_message = f"Votre code de vérification est : {code}"
+
+    # Envoyer le SMS
+    sms_sent_successfully = send_sms(phone_number, sms_message)
+
+    if sms_sent_successfully:
+        current_state['sms_sent'] = True
+        print(f"SMS envoyé à {username} ({phone_number}). En attente de vérification.")
+        # Le serveur a fait sa part, l'ESP32 peut considérer que c'est OK.
+        # Le client web (navigateur) sera redirigé via une autre requête (check_status)
+        return jsonify({'message': 'Code reçu et SMS envoyé.'}), 200
+    else:
+        print(f"Échec de l'envoi du SMS à {username}. Annulation de la tentative.")
+        # Annuler l'état car le SMS n'a pas pu être envoyé
+        del auth_states[username]
+        return jsonify({'message': 'Échec de l'envoi du SMS.'}), 500
+
+# NOUVELLE ROUTE pour vérifier périodiquement l'état après /login
+@app.route('/check_login_status')
+def check_login_status():
+    cleanup_expired_states()
+    username = session.get('username')
+    login_attempt_time = session.get('login_attempt_time')
+
+    if not username or not login_attempt_time:
+        return jsonify({'status': 'fail', 'message': 'Session invalide ou expirée.'}), 401
+
+    # Vérifier si la tentative de session est récente (évite réutilisation)
+    if time.time() > login_attempt_time + STATE_TIMEOUT:
+         session.pop('username', None)
+         session.pop('login_attempt_time', None)
+         return jsonify({'status': 'fail', 'message': 'Tentative de connexion expirée.'}), 401
+
+    if username not in auth_states:
+        # L'état a peut-être expiré ou a été complété/annulé
+        return jsonify({'status': 'fail', 'message': 'État de connexion introuvable.'}), 404
+
+    current_state = auth_states[username]
+
+    if current_state['status'] == 'awaiting_sms_verification' and current_state['sms_sent']:
+        # Le code a été reçu, le SMS envoyé, on peut rediriger vers la saisie SMS
+        print(f"Statut pour {username} est {current_state['status']}. Préparation de la redirection vers la vérification SMS.")
+        redirect_url = url_for('verify_sms_page') # Utilise la session, pas besoin de passer username/token
+        return jsonify({
+            'status': 'redirect_to_sms_verify',
+            'message': 'Code reçu de l'appareil et SMS envoyé. Redirection vers la vérification...',
+            'redirect_url': redirect_url
+        }), 200
+    elif current_state['status'] == 'awaiting_device_code':
+        # Toujours en attente du code de l'appareil
+        return jsonify({'status': 'awaiting_device_code', 'message': 'En attente du code de l'appareil...'}), 202 # Accepted
+    else:
+        # État inattendu ou échec
+        return jsonify({'status': 'fail', 'message': f'État inattendu: {current_state['status']}'}), 409
+
+# NOUVELLE ROUTE pour la page de saisie du code SMS
+@app.route('/verify_sms', methods=['GET'])
+def verify_sms_page():
+    username = session.get('username')
+    if not username or username not in auth_states or auth_states[username]['status'] != 'awaiting_sms_verification':
+        # Rediriger vers login si l'état n'est pas correct
+        return redirect(url_for('index'))
+
+    # Afficher la page de saisie du code
+    return render_template_string('''
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vérification SMS</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style> body { background-color: #f8f9fa; } .container { max-width: 400px; margin-top: 50px; padding: 20px; background-color: #fff; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); } </style>
+</head>
+<body>
+    <div class="container">
+        <h1 class="text-center mb-4">Vérification 2FA</h1>
+        <p class="text-center">Un code a été envoyé par SMS au numéro associé à votre compte.</p>
+        <form id="verify-form" action="/verify_sms" method="post">
+            <div class="mb-3">
+                <label for="sms_code" class="form-label">Code reçu par SMS:</label>
+                <input type="text" class="form-control" id="sms_code" name="sms_code" required pattern="[0-9]{6}" inputmode="numeric" maxlength="6">
+            </div>
+            <button type="submit" class="btn btn-primary w-100">Vérifier</button>
+        </form>
+        <div id="verify-status" class="alert d-none mt-3" role="alert"></div>
+    </div>
+    <script>
+        document.getElementById('verify-form').addEventListener('submit', async function(event) {
+            event.preventDefault();
+            const form = event.target;
+            const formData = new FormData(form);
+            const statusDiv = document.getElementById('verify-status');
+            statusDiv.classList.add('d-none');
+
+            try {
+                const response = await fetch(form.action, {
+                    method: form.method,
+                    body: formData
+                });
+                const result = await response.json();
+                statusDiv.textContent = result.message;
+                statusDiv.classList.remove('d-none', 'alert-success', 'alert-danger');
+
+                if (result.status === 'success') {
+                    statusDiv.classList.add('alert-success');
+                    // Redirection vers le tableau de bord ou page d'accueil après succès
+                    setTimeout(() => { window.location.href = '/success'; }, 1000);
+                } else {
+                    statusDiv.classList.add('alert-danger');
+                }
+            } catch (error) {
+                console.error('Erreur lors de la vérification SMS:', error);
+                statusDiv.textContent = 'Une erreur est survenue.';
+                statusDiv.classList.remove('d-none');
+                statusDiv.classList.add('alert-danger');
+            }
+        });
+    </script>
+</body>
+</html>
+    ''')
+
+# NOUVELLE ROUTE pour traiter la soumission du code SMS
+@app.route('/verify_sms', methods=['POST'])
+def verify_sms_code():
+    global auth_states
     cleanup_expired_states()
 
-    # Dans une vraie application, l'utilisateur serait identifié par une session sécurisée.
-    # Ici, on utilise l'état temporaire basé sur le nom d'utilisateur.
-    # L'utilisateur doit accéder à cette page APRÈS avoir réussi la vérification du code.
+    username = session.get('username')
+    login_attempt_time = session.get('login_attempt_time')
+    sms_code_entered = request.form.get('sms_code')
 
-    # Vérifier si au moins un utilisateur est temporairement authentifié avec succès
-    authenticated_user = None
-    for user, data in list(auth_states.items()): # Utiliser list() car le dict peut être modifié pendant l'itération
-        if data['status'] == 'success' and time.time() < data['timestamp'] + STATE_TIMEOUT:
-            authenticated_user = user
-            break # Trouver le premier utilisateur authentifié temporairement
+    if not username or not login_attempt_time:
+        return jsonify({'status': 'fail', 'message': 'Session invalide ou expirée.'}), 401
 
-    if authenticated_user:
-        # Afficher la page de l'espace cloud
-        return render_template_string(f'''
-            <!DOCTYPE html>
-            <html lang="fr">
-            <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>Espace Cloud</title>
-                <!-- Bootstrap CSS -->
-                <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-                 <style>
-                    body {{
-                        background-color: #f8f9fa;
-                    }}
-                    .container {{
-                        margin-top: 50px;
-                        padding: 20px;
-                        background-color: #ffffff;
-                        border-radius: 8px;
-                        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
-                    }}
-                    h1, h2 {{
-                        text-align: center;
-                        margin-bottom: 20px;
-                    }}
-                </style>
-            </head>
-            <body>
-                <div class="container">
-                    <h1>Bienvenue dans votre Espace Cloud, {authenticated_user}!</h1>
-                    <p>Ceci est votre espace personnel sécurisé.</p>
-                    <p class="text-center mt-4"><a href="/" class="btn btn-danger">Se déconnecter (simulé - retourne à l'accueil)</a></p>
-                </div>
-                 <!-- Bootstrap JS (optionnel) -->
-                <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
-            </body>
-            </html>
-        ''')
+    # Vérifier fraîcheur
+    if time.time() > login_attempt_time + STATE_TIMEOUT:
+         session.pop('username', None)
+         session.pop('login_attempt_time', None)
+         if username in auth_states: del auth_states[username]
+         return jsonify({'status': 'fail', 'message': 'Tentative de connexion expirée.'}), 401
+
+    if not sms_code_entered:
+        return jsonify({'status': 'fail', 'message': 'Code SMS requis.'}), 400
+
+    if username not in auth_states or auth_states[username]['status'] != 'awaiting_sms_verification':
+        return jsonify({'status': 'fail', 'message': 'État de vérification invalide.'}), 409
+
+    current_state = auth_states[username]
+    expected_code = current_state.get('received_device_code')
+
+    if not expected_code:
+        # Ne devrait pas arriver si l'état est correct
+        print(f"Erreur: Code attendu manquant pour {username} dans l'état {current_state['status']}")
+        del auth_states[username] # Nettoyer l'état incohérent
+        session.pop('username', None)
+        session.pop('login_attempt_time', None)
+        return jsonify({'status': 'fail', 'message': 'Erreur interne du serveur.'}), 500
+
+    if sms_code_entered == expected_code:
+        print(f"Vérification SMS réussie pour {username}.")
+        # Nettoyer l'état d'authentification temporaire
+        del auth_states[username]
+        # Marquer la session comme authentifiée (pourrait être utilisé par d'autres routes)
+        session['authenticated'] = True
+        session['auth_time'] = time.time()
+        # Ne pas supprimer username/login_attempt_time tout de suite, peut être utile
+        return jsonify({'status': 'success', 'message': 'Vérification réussie! Connexion établie.'}), 200
     else:
-        # Rediriger vers la page de connexion si non authentifié temporairement
-        print("Accès à l'espace cloud refusé: non authentifié temporairement.")
-        return redirect(url_for('index')) # Rediriger vers la page d'accueil/connexion
+        print(f"Échec de la vérification SMS pour {username}. Attendu: {expected_code}, Reçu: {sms_code_entered}")
+        # Ne pas supprimer l'état tout de suite, l'utilisateur pourrait réessayer (ajouter un compteur de tentatives?)
+        # Pour l'instant, simple échec
+        # Optionnel: Invalider la tentative après X échecs
+        return jsonify({'status': 'fail', 'message': 'Code SMS incorrect.'}), 401
 
-# --- Exécution de l'application ---
+# Page de succès simple
+@app.route('/success')
+def success_page():
+    username = session.get('username')
+    if not session.get('authenticated'):
+        return redirect(url_for('index'))
+
+    # Nettoyer les infos temporaires de la session si on ne les utilise plus
+    # session.pop('login_attempt_time', None)
+
+    return render_template_string('''
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <title>Succès</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container mt-5">
+        <div class="alert alert-success" role="alert">
+            <h4 class="alert-heading">Connexion réussie!</h4>
+            <p>Bienvenue, {{ username }}!</p>
+            <hr>
+            <p class="mb-0">Vous êtes maintenant connecté.</p>
+        </div>
+        <a href="/logout" class="btn btn-secondary">Se déconnecter</a>
+    </div>
+</body>
+</html>
+    ''', username=username)
+
+@app.route('/logout')
+def logout():
+    # Nettoyer la session
+    session.clear()
+    return redirect(url_for('index'))
 
 if __name__ == '__main__':
-    # Utiliser le serveur de développement Flask pour les tests locaux
-    # app.run(debug=True, host='0.0.0.0')
-
-    # Pour le déploiement sur Render, Gunicorn sera configuré pour exécuter l'application.
-    # Cette partie du code ne s'exécutera pas directement sur Render si vous utilisez un Procfile standard.
-    print("Application Flask démarrée. Utilisez un serveur WSGI de production comme Gunicorn pour le déploiement.")
+    # Utiliser '0.0.0.0' pour être accessible depuis l'extérieur du conteneur/VM
+    # Le port 5000 est souvent utilisé par défaut pour Flask
+    app.run(host='0.0.0.0', port=5000, debug=True) # debug=True pour le développement
