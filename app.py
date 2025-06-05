@@ -9,11 +9,24 @@ import random
 # Importer la bibliothèque Twilio (assurez-vous de l'installer: pip install twilio)
 from twilio.rest import Client
 import uuid # Pour générer des tokens uniques
+import logging # Pour une journalisation plus robuste
 
 app = Flask(__name__)
 # Clé secrète pour sécuriser les sessions Flask (même si non utilisées ici, bonne pratique)
 # Utilisez une variable d'environnement en production! Pour test local rapide:
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'une_cle_tres_secrete_par_defaut') # À changer!
+
+# --- Configuration de la Journalisation (Logging) ---
+# Configurer le niveau de journalisation (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+app.logger.setLevel(logging.DEBUG) # Définir le niveau de journalisation
+# Créer un gestionnaire de fichiers (pour écrire les logs dans un fichier)
+file_handler = logging.FileHandler('app.log')
+file_handler.setLevel(logging.DEBUG)
+# Créer un formatteur (pour définir le format des messages de log)
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(formatter)
+# Ajouter le gestionnaire de fichiers à l'application Flask
+app.logger.addHandler(file_handler)
 
 # --- Configuration Twilio ---
 # Utilisez des variables d'environnement pour les identifiants Twilio sur Render
@@ -27,9 +40,9 @@ twilio_client = None
 if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
     try:
         twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        print("Client Twilio initialisé.")
+        app.logger.info("Client Twilio initialisé.")
     except Exception as e:
-        print(f"Erreur lors de l'initialisation du client Twilio: {e}")
+        app.logger.error(f"Erreur lors de l'initialisation du client Twilio: {e}")
         twilio_client = None # S'assurer qu'il est None en cas d'erreur
 
 def send_sms(to_phone_number, message_body):
@@ -41,13 +54,13 @@ def send_sms(to_phone_number, message_body):
                 from_=TWILIO_PHONE_NUMBER,
                 body=message_body
             )
-            print(f"SMS envoyé à {to_phone_number}: {message_body}")
+            app.logger.info(f"SMS envoyé à {to_phone_number}: {message_body}")
             return True
         except Exception as e:
-            print(f"Échec de l'envoi du SMS à {to_phone_number}: {e}")
+            app.logger.error(f"Échec de l'envoi du SMS à {to_phone_number}: {e}")
             return False
     else:
-        print("Client Twilio non configuré, numéro Twilio manquant ou numéro destinataire manquant. SMS non envoyé.")
+        app.logger.warning("Client Twilio non configuré, numéro Twilio manquant ou numéro destinataire manquant. SMS non envoyé.")
         return False
 
 # --- Configuration du fichier JSON ---
@@ -68,6 +81,10 @@ def load_users():
                 return data
         except json.JSONDecodeError:
             # Gérer le cas où le fichier JSON est vide ou corrompu
+            app.logger.warning("Fichier users.json vide ou corrompu. Retour d'un dictionnaire vide.")
+            return {}
+        except Exception as e:
+            app.logger.error(f"Erreur lors du chargement de users.json: {e}")
             return {}
     else:
         # Si le fichier n'existe pas, retourner un dictionnaire vide
@@ -75,19 +92,21 @@ def load_users():
 
 def save_users(users_data):
     """Sauvegarde les données des utilisateurs dans le fichier JSON."""
-    # Utiliser 'w' pour écraser le contenu existant avec les nouvelles données
-    with open(JSON_FILE_PATH, 'w') as f:
-        json.dump(users_data, f, indent=4) # Utiliser indent pour une meilleure lisibilité
+    try:
+        with open(JSON_FILE_PATH, 'w') as f:
+            json.dump(users_data, f, indent=4) # Utiliser indent pour une meilleure lisibilité
+    except Exception as e:
+        app.logger.error(f"Erreur lors de la sauvegarde de users.json: {e}")
 
 # Charger les utilisateurs au démarrage de l'application
 # ATTENTION: Sur les services gratuits comme Render, ce fichier peut être réinitialisé
 # à chaque redémarrage du service, entraînant la perte des utilisateurs enregistrés.
 users = load_users()
-print(f"Chargé {len(users)} utilisateurs depuis {JSON_FILE_PATH}")
+app.logger.info(f"Chargé {len(users)} utilisateurs depuis {JSON_FILE_PATH}")
 
 # --- Gestion de l'état d'authentification temporaire ---
 # Stocke les tentatives de connexion en attente de code
-# {username: {'device': '...', 'code': '...', 'browser_token': '...', 'timestamp': '...'}}
+# {username: {'code': '...', 'browser_token': '...', 'timestamp': '...'}}
 auth_states = {}
 STATE_TIMEOUT = 300 # Durée de validité d'un état en secondes (5 minutes)
 
@@ -96,7 +115,7 @@ def cleanup_expired_states():
     current_time = time.time()
     expired_users = [username for username, data in auth_states.items() if current_time > data['timestamp'] + STATE_TIMEOUT]
     for username in expired_users:
-        print(f"Nettoyage de l'état expiré pour {username} (statut: en attente de code)")
+        app.logger.info(f"Nettoyage de l'état expiré pour {username} (en attente de code).")
         del auth_states[username]
 
 # --- Routes pour l'interface utilisateur ---
@@ -298,14 +317,12 @@ def register():
     if username in users:
         return jsonify({"message": "Nom d'utilisateur déjà existant"}), 409
 
-    # Pas de secret TOTP ici, car on n'utilise plus TOTP
-
     users[username] = {
         'password_hash': generate_password_hash(password),
         'phone_number': phone_number if phone_number else None
     }
     save_users(users)
-    print(f"Utilisateur {username} enregistré.")
+    app.logger.info(f"Utilisateur {username} enregistré.")
     return jsonify({"message": "Utilisateur enregistré avec succès."}), 201
 
 @app.route('/login', methods=['POST'])
@@ -320,18 +337,18 @@ def login():
 
     if not user or not check_password_hash(user['password_hash'], password):
         # Échec de la vérification du mot de passe
-        print(f"Échec de connexion (mot de passe) pour {username}: Identifiants invalides.")
+        app.logger.warning(f"Échec de connexion (mot de passe) pour {username}: Identifiants invalides.")
         # Envoyer un SMS d'échec de tentative de connexion
         if user and user.get('phone_number'): # Envoyer SMS seulement si l'utilisateur existe et a un numéro
              send_sms(user['phone_number'], f"Tentative de connexion échouée pour votre compte cloud avec le nom d'utilisateur {username}.")
         elif not user:
-             print(f"Tentative de connexion échouée pour utilisateur inconnu: {username}")
+             app.logger.warning(f"Tentative de connexion échouée pour utilisateur inconnu: {username}")
 
         # Retourner l'échec au navigateur
         return jsonify({"status": "fail", "message": "Nom d'utilisateur ou mot de passe invalide"}), 401
     else:
         # Mot de passe correct. Générer un code et attendre la soumission.
-        print(f"Mot de passe correct pour {username}. Génération d'un code et envoi par SMS.")
+        app.logger.info(f"Mot de passe correct pour {username}. Génération d'un code et envoi par SMS.")
 
         # Générer un code aléatoire
         random_code = str(random.randint(100000, 999999))
@@ -349,7 +366,10 @@ def login():
 
         # Envoyer le code à l'utilisateur par SMS
         sms_message = f"Votre code de connexion pour votre compte cloud: {random_code}. Saisissez-le sur la page de connexion."
-        send_sms(user['phone_number'], sms_message)
+        if user.get('phone_number'):
+            send_sms(user['phone_number'], sms_message)
+        else:
+            app.logger.warning(f"Impossible d'envoyer le SMS à {username}: numéro de téléphone manquant.")
 
         # Rediriger le navigateur vers la page de saisie du code avec le token
         return jsonify({"status": "code_required", "message": "Mot de passe correct. Un code a été envoyé par SMS. Veuillez le saisir.", "redirect_url": url_for('verify_code_page', token=auth_token, _external=True)}), 200
@@ -358,7 +378,8 @@ def login():
 def verify_code_page():
     # Page pour saisir le code
     auth_token = request.args.get('token')
-    if not auth_token or not auth_token in auth_states:
+    if not auth_token or auth_token not in auth_states:
+        app.logger.warning("Requête invalide ou expirée pour la vérification du code.")
         return "Requête invalide ou expirée.", 400 # Gérer les tokens manquants ou invalides
 
     # Afficher le formulaire de saisie du code
@@ -457,7 +478,7 @@ def verify_code():
     state_data = auth_states.get(browser_token)
 
     if not state_data:
-        print("Vérification du code échouée: Token invalide ou expiré.")
+        app.logger.warning("Vérification du code échouée: Token invalide ou expiré.")
         # Ne pas envoyer de SMS ici car on ne sait pas à quel utilisateur l'associer de manière fiable
         return jsonify({"status": "fail", "message": "Session de vérification expirée ou invalide. Veuillez recommencer la connexion."}), 400
 
@@ -467,7 +488,7 @@ def verify_code():
 
     if not user:
          # Cas improbable si state_data existe mais pas l'utilisateur, mais sécurité
-         print(f"Vérification du code échouée pour {username}: Utilisateur introuvable.")
+         app.logger.error(f"Vérification du code échouée pour {username}: Utilisateur introuvable.")
          del auth_states[browser_token] # Nettoyer l'état
          # recent_auth_status[username] = {'status': 'fail', 'timestamp': time.time()} # Pas de statut pour les appareils ici
          if user and user.get('phone_number'):
@@ -478,9 +499,9 @@ def verify_code():
     # Vérifier le code saisi par l'utilisateur par rapport au code attendu
     if code_user_input == expected_code:
         # Vérification réussie
-        print(f"Vérification du code réussie pour {username}.")
-        del auth_states[browser_token] # Nettoyer l'état en attente
-        # recent_auth_status[username] = {'status': 'success', 'timestamp': time.time()} # Pas de statut pour les appareils ici
+        app.logger.info(f"Vérification du code réussie pour {username}.")
+        auth_states[browser_token]['status'] = 'success' # Mettre à jour l'état
+        auth_states[browser_token]['timestamp'] = time.time() # Mettre à jour le timestamp pour la durée de la session
         # Envoyer un SMS de connexion réussie
         if user.get('phone_number'):
              send_sms(user['phone_number'], f"Connexion réussie à votre compte cloud.")
@@ -489,7 +510,7 @@ def verify_code():
         return jsonify({"status": "success", "message": "Vérification réussie. Redirection vers votre espace cloud...", "redirect_url": url_for('cloud_space', _external=True)}), 200
     else:
         # Code invalide
-        print(f"Vérification du code échouée pour {username}: Code invalide.")
+        app.logger.warning(f"Vérification du code échouée pour {username}: Code invalide.")
         # Ne pas supprimer l'état pending_2fa_verifications tout de suite pour permettre de réessayer
         # L'état expirera après PENDING_TIMEOUT.
         # recent_auth_status[username] = {'status': 'fail', 'timestamp': time.time()} # Pas de statut pour les appareils ici
@@ -507,7 +528,7 @@ def submit_code():
     device_type = data.get('device_type')
     code = data.get('code')
 
-    print(f"Code reçu de l'appareil {device_type} pour l'utilisateur {username}: {code}")
+    app.logger.info(f"Code reçu de l'appareil {device_type} pour l'utilisateur {username}: {code}")
 
     # Trouver l'état de l'utilisateur
     state_data = auth_states.get(username)
@@ -515,12 +536,12 @@ def submit_code():
 
     # Vérifier si l'utilisateur existe et si une tentative est en attente
     if not user or not state_data or state_data['status'] != 'awaiting_code':
-        print(f"Soumission du code échouée pour {username} depuis {device_type}: Pas d'état en attente.")
+        app.logger.warning(f"Soumission du code échouée pour {username} depuis {device_type}: Pas d'état en attente.")
         return jsonify({"status": "fail", "message": "Pas de tentative de connexion en attente"}), 400
 
     # Stocker le code reçu
     state_data['code'] = code
-    print(f"Code stocké pour {username}.")
+    app.logger.info(f"Code stocké pour {username}.")
     return jsonify({"status": "success", "message": "Code reçu et stocké par le serveur."}), 200
 
 # --- Route pour l'espace cloud (protégée temporairement) ---
