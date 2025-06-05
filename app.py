@@ -312,9 +312,11 @@ def register():
     phone_number = request.form.get('phone_number')
 
     if not username or not password:
+        app.logger.warning("Tentative d'inscription échouée: Nom d'utilisateur et mot de passe requis.")
         return jsonify({"message": "Nom d'utilisateur et mot de passe requis"}), 400
 
     if username in users:
+        app.logger.warning(f"Tentative d'inscription échouée: Nom d'utilisateur déjà existant: {username}.")
         return jsonify({"message": "Nom d'utilisateur déjà existant"}), 409
 
     users[username] = {
@@ -367,17 +369,24 @@ def login():
         # Envoyer le code à l'utilisateur par SMS
         sms_message = f"Votre code de connexion pour votre compte cloud: {random_code}. Saisissez-le sur la page de connexion."
         if user.get('phone_number'):
-            send_sms(user['phone_number'], sms_message)
+            if send_sms(user['phone_number'], sms_message):
+                app.logger.info(f"SMS envoyé avec succès à {username} pour la vérification du code.")
+            else:
+                app.logger.error(f"Échec de l'envoi du SMS à {username} pour la vérification du code.")
         else:
             app.logger.warning(f"Impossible d'envoyer le SMS à {username}: numéro de téléphone manquant.")
 
         # Rediriger le navigateur vers la page de saisie du code avec le token
-        return jsonify({"status": "code_required", "message": "Mot de passe correct. Un code a été envoyé par SMS. Veuillez le saisir.", "redirect_url": url_for('verify_code_page', token=auth_token, _external=True)}), 200
+        redirect_url = url_for('verify_code_page', token=auth_token, _external=True)
+        app.logger.debug(f"URL de redirection: {redirect_url}")
+        return jsonify({"status": "code_required", "message": "Mot de passe correct. Un code a été envoyé par SMS. Veuillez le saisir.", "redirect_url": redirect_url}), 200
 
 @app.route('/verify_code_page')
 def verify_code_page():
     # Page pour saisir le code
     auth_token = request.args.get('token')
+    app.logger.debug(f"Accès à /verify_code_page avec token: {auth_token}")
+
     if not auth_token or auth_token not in auth_states:
         app.logger.warning("Requête invalide ou expirée pour la vérification du code.")
         return "Requête invalide ou expirée.", 400 # Gérer les tokens manquants ou invalides
